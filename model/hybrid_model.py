@@ -1,0 +1,254 @@
+import torch
+import torch.nn as nn
+from typing import List, Optional, Tuple, Union, Callable
+
+from transformers import GenerationConfig, LogitsProcessorList, StoppingCriteriaList, GenerateOutput, BaseStreamer, \
+    PreTrainedModel
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+
+from transformers.models.smolvlm.modeling_smolvlm import (SmolVLMModel,
+                                                          SmolVLMBaseModelOutputWithPast, logger,
+                                                          DynamicCache, SmolVLMConfig,
+                                                          SmolVLMForConditionalGeneration, KwargsForCausalLM,
+                                                          SmolVLMCausalLMOutputWithPast)
+from transformers.processing_utils import Unpack
+
+from decoder_layer import HybridDecoderLayers
+
+class HybridOutput(SmolVLMBaseModelOutputWithPast):
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[tuple[tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor], tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
+    image_hidden_states: Optional[tuple[torch.FloatTensor]] = None
+
+class Hybrid_SmolVLM(SmolVLMModel):
+    def __init__(self,config : SmolVLMConfig):
+        super().__init__(config)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_attention_mask: Optional[torch.BoolTensor] = None,
+        image_hidden_states: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        teacher_outputs = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Union[tuple, HybridOutput]:
+        r"""
+                pixel_attention_mask (`torch.Tensor` of shape `(batch_size, image_size, image_size)`, *optional*):
+                    Mask to avoid performing attention on padding pixel indices.
+                image_hidden_states (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                    The hidden states of the image encoder after modality projection.
+                """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if self.training and self.text_model.gradient_checkpointing and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+            )
+            use_cache = False
+
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        past_seen_tokens = 0
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            past_seen_tokens = past_key_values.get_seq_length()
+
+        if inputs_embeds is not None and input_ids is None and past_seen_tokens == 0:
+            raise ValueError("When first calling the model, if input_embeds are passed, input_ids should not be None.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.text_model.get_input_embeddings()(input_ids).to(input_ids.device)
+
+        # START VISUAL INPUTS INTEGRATION
+        if pixel_values is not None and image_hidden_states is not None:
+            raise ValueError("You cannot specify both pixel_values and image_hidden_states at the same time")
+        elif pixel_values is not None:
+            image_hidden_states = self.get_image_features(pixel_values, pixel_attention_mask).to(input_ids.device)
+        elif image_hidden_states is not None:
+            image_hidden_states = image_hidden_states.to(dtype=self.dtype, device=input_ids.device)
+
+        if inputs_embeds is not None and image_hidden_states is not None:
+            # When we generate, we don't want to replace the potential image_token_id that we generated by images
+            # that simply don't exist
+            inputs_embeds = self.inputs_merger(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                image_hidden_states=image_hidden_states,
+            )
+
+        # NEW VERSION FOR DISTILLATION
+        hidden_states = inputs_embeds
+
+        all_hidden_states = ()
+        all_hidden_states = () if output_hidden_states else None
+        all_teacher_hidden_states = (
+        teacher_outputs[0],) if output_hidden_states and teacher_outputs is not None else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+
+        mamba_layer_id = 0
+        for layer_id, decoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            if isinstance(decoder_layer, HybridDecoderLayers):
+                mamba_layer_id += 1
+
+            hidden_states_run = [hidden_states]
+            if teacher_outputs is not None:
+                teacher_hidden_states = teacher_outputs[layer_id]
+                hidden_states_run.append(teacher_hidden_states)
+
+            hidden_states_out = []
+            for hidden_states_now in hidden_states_run:
+                if self.gradient_checkpointing and self.training and isinstance(decoder_layer, HybridDecoderLayers):
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states_now,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states_now,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
+                hidden_states_out.append(layer_outputs[0])
+
+            hidden_states = hidden_states_out[0]  # type: ignore
+
+            if teacher_outputs is not None and output_hidden_states and layer_id != len(self.layers) - 1:
+                all_teacher_hidden_states += (hidden_states_out[1],)
+
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.final_layernorm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+            if teacher_outputs is not None:
+                all_teacher_hidden_states += (self.final_layernorm(hidden_states_out[1]),)
+
+        return HybridOutput(
+            last_hidden_state=hidden_states,
+            past_key_values=next_decoder_cache,
+            hidden_states=(all_hidden_states,all_teacher_hidden_states),
+            attentions=all_self_attns,
+            image_hidden_states=image_hidden_states,
+        )
+
+
+class HybridOutputCausalLM(SmolVLMCausalLMOutputWithPast):
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[list[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[torch.FloatTensor],tuple[torch.FloatTensor]] = None
+    attentions: Optional[tuple[torch.FloatTensor]] = None
+    image_hidden_states: Optional[tuple[torch.FloatTensor]] = None
+
+
+class HybridSmolVLMForConditionalGeneration(SmolVLMForConditionalGeneration):
+    def __init__(self,config:SmolVLMConfig):
+        super().__init__(config)
+        self.model = Hybrid_SmolVLM(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_attention_mask: Optional[torch.BoolTensor] = None,
+        image_hidden_states: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        return_dict: Optional[bool] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> Union[tuple, HybridOutputCausalLM]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            image_hidden_states=image_hidden_states,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            return_dict=True,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
+
+        return HybridOutputCausalLM(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+        )
