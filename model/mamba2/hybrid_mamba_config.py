@@ -20,7 +20,7 @@ class MambaConfig:
 class PhiMambaConfig:
     d_model: int = 2560
     ssm_cfg: dict = field(default_factory=dict)
-    layer_norm_eps: float = 1e-5
+    rms_norm_eps: float = 1e-5
     vocab_size: int = None
     d_inner: int = None
     d_xb: int = 2560
