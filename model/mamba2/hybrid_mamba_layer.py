@@ -10,8 +10,11 @@ from einops import rearrange, repeat
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+
+    print("successfully imported causal_conv1d package")
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
+    print("causal_conv1d package not found. Will use slower conv1d implementation")
 
 try:
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
@@ -33,6 +36,7 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 from huggingface_hub import PyTorchModelHubMixin
 
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -44,38 +48,39 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+
 class Mamba2(nn.Module, PyTorchModelHubMixin):
     def __init__(
-        self,
-        d_model,
-        d_xb,
-        d_inner=None,
-        d_state=128,
-        d_conv=4,
-        conv_init=None,
-        expand=2,
-        headdim=64,
-        d_ssm=None,  # If not None, we only apply SSM on this many dimensions, the rest uses gated MLP
-        ngroups=1,
-        A_init_range=(1, 16),
-        D_has_hdim=False,
-        rmsnorm=True,
-        norm_before_gate=False,
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init_floor=1e-4,
-        dt_limit=(0.0, float("inf")),
-        repeat_kv_before_conv=False,
-        bias=False,
-        conv_bias=True,
-        # Fused kernel and sharding options
-        chunk_size=256,
-        use_mem_eff_path=True,
-        layer_idx=None,  # Absorb kwarg for general module
-        process_group=None,
-        sequence_parallel=True,
-        device=None,
-        dtype=None,
+            self,
+            d_model,
+            d_xb,
+            d_inner=None,
+            d_state=128,
+            d_conv=4,
+            conv_init=None,
+            expand=2,
+            headdim=64,
+            d_ssm=None,  # If not None, we only apply SSM on this many dimensions, the rest uses gated MLP
+            ngroups=1,
+            A_init_range=(1, 16),
+            D_has_hdim=False,
+            rmsnorm=True,
+            norm_before_gate=False,
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init_floor=1e-4,
+            dt_limit=(0.0, float("inf")),
+            repeat_kv_before_conv=False,
+            bias=False,
+            conv_bias=True,
+            # Fused kernel and sharding options
+            chunk_size=256,
+            use_mem_eff_path=True,
+            layer_idx=None,  # Absorb kwarg for general module
+            process_group=None,
+            sequence_parallel=True,
+            device=None,
+            dtype=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -110,7 +115,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         assert self.d_inner == self.ngroups * self.d_state
         assert self.d_inner == self.d_ssm
-        
+
         self.nheads = self.ngroups
         self.headdim = self.d_state
 
@@ -122,7 +127,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
         else:
             self.in_proj = ColumnParallelLinear(self.d_model, d_in_proj * self.world_size, bias=bias,
-                                                process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+                                                process_group=self.process_group,
+                                                sequence_parallel=self.sequence_parallel,
                                                 **factory_kwargs)
 
         # conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
@@ -149,7 +155,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 padding=d_conv - 1,
                 **factory_kwargs,
             )
-        
+
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
@@ -187,7 +193,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         else:
             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
-                                              process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+                                              process_group=self.process_group,
+                                              sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
 
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
@@ -220,7 +227,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        
+
         # [z, x, B, C, dt]
         d_mlp = (zxbcdt.shape[-1] - 2 * self.d_inner - 2 * self.d_xb - self.nheads) // 2
         z0, x0, z, xBC, dt = torch.split(
@@ -259,16 +266,21 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
             assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
-            xBC = self.act(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2))
-
+            xBC = self.act(
+                self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, -(self.d_conv - 1):]
+            )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
         else:
-            xBC = self.act(self.conv1d(xBC.transpose(1, 2)).transpose(1, 2))
-            # xBC 已裁剪到 (B, L_conv, dim)；确保 dt 的第二维也等于 L_conv
+            xBC = causal_conv1d_fn(
+                xBC.transpose(1, 2),
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            ).transpose(1, 2)
 
-
-        
         if self.repeat_kv_before_conv:
-            x, B, C = torch.split(xBC, [self.ngroups * self.d_state, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            x, B, C = torch.split(xBC, [self.ngroups * self.d_state, self.ngroups * self.d_state,
+                                        self.ngroups * self.d_state], dim=-1)
 
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
@@ -291,15 +303,14 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         else:
             # self.d_xb + self.d_xb + self.d_inner
             x, B, C = torch.split(xBC, [self.d_xb, self.d_xb, self.ngroups * self.d_state], dim=-1)
-            
+
             # minic the GQA
             x = rearrange(x, "b l (xb_group dstate) -> b xb_group l dstate", dstate=self.d_state)
             x = repeat_kv(x, self.repeat_group)
             # x shape: (bsz, n_group, l, dim)
-            
+
             B = rearrange(B, "b l (xb_group dstate) -> b xb_group l dstate", dstate=self.d_state)
             B = repeat_kv(B, self.repeat_group)
-            # print(dt.shape)
 
             y = mamba_chunk_scan_combined(
                 # rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
@@ -369,17 +380,17 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
         x, B, C = torch.split(xBC, [self.d_xb, self.d_xb, self.ngroups * self.d_state], dim=-1)
-        
+
         # minic the GQA
         x = rearrange(x, "b (xb_group dstate) -> b xb_group dstate", dstate=self.d_state)
         x_reshaped = torch.repeat_interleave(x, dim=1, repeats=self.repeat_group)
 
         B = rearrange(B, "b (xb_group dstate) -> b xb_group dstate", dstate=self.d_state)
         B = torch.repeat_interleave(B, dim=1, repeats=self.repeat_group)
-        
+
         # SSM step
         assert selective_state_update is not None
-            
+
         A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
         dt = repeat(dt, "b h -> b h p", p=self.headdim)
         dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)

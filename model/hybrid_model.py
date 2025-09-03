@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple, Union, Callable
 
-from transformers import GenerationConfig, LogitsProcessorList, StoppingCriteriaList, GenerateOutput, BaseStreamer, \
-    PreTrainedModel
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from transformers.models.smolvlm.modeling_smolvlm import (SmolVLMModel,
@@ -13,18 +11,19 @@ from transformers.models.smolvlm.modeling_smolvlm import (SmolVLMModel,
                                                           SmolVLMCausalLMOutputWithPast)
 from transformers.processing_utils import Unpack
 
-from decoder_layer import HybridDecoderLayers
+from .decoder_layer import HybridDecoderLayers
 
 class HybridOutput(SmolVLMBaseModelOutputWithPast):
     last_hidden_state: Optional[torch.FloatTensor] = None
     past_key_values: Optional[tuple[tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[tuple[torch.FloatTensor], tuple[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[tuple[torch.FloatTensor, torch.FloatTensor], ...]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[tuple[torch.FloatTensor]] = None
 
 class Hybrid_SmolVLM(SmolVLMModel):
     def __init__(self,config : SmolVLMConfig):
         super().__init__(config)
+        self.gradient_checkpointing = True
 
     def forward(
         self,
@@ -43,7 +42,7 @@ class Hybrid_SmolVLM(SmolVLMModel):
         cache_position: Optional[torch.LongTensor] = None,
         teacher_outputs = None,
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[tuple, HybridOutput]:
+    ) -> Union[tuple, SmolVLMBaseModelOutputWithPast]:
         r"""
                 pixel_attention_mask (`torch.Tensor` of shape `(batch_size, image_size, image_size)`, *optional*):
                     Mask to avoid performing attention on padding pixel indices.
@@ -99,87 +98,114 @@ class Hybrid_SmolVLM(SmolVLMModel):
                 inputs_embeds=inputs_embeds,
                 image_hidden_states=image_hidden_states,
             )
-
-        # NEW VERSION FOR DISTILLATION
-        hidden_states = inputs_embeds
-
-        all_hidden_states = ()
-        all_hidden_states = () if output_hidden_states else None
-        all_teacher_hidden_states = (
-        teacher_outputs[0],) if output_hidden_states and teacher_outputs is not None else None
-        all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
-
-        mamba_layer_id = 0
-        for layer_id, decoder_layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-            if isinstance(decoder_layer, HybridDecoderLayers):
-                mamba_layer_id += 1
-
-            hidden_states_run = [hidden_states]
-            if teacher_outputs is not None:
-                teacher_hidden_states = teacher_outputs[layer_id]
-                hidden_states_run.append(teacher_hidden_states)
-
-            hidden_states_out = []
-            for hidden_states_now in hidden_states_run:
-                if self.gradient_checkpointing and self.training and isinstance(decoder_layer, HybridDecoderLayers):
-                    layer_outputs = self._gradient_checkpointing_func(
-                        decoder_layer.__call__,
-                        hidden_states_now,
-                        attention_mask,
-                        position_ids,
-                        past_key_values,
-                        output_attentions,
-                        use_cache,
-                        cache_position,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        hidden_states_now,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                    )
-                hidden_states_out.append(layer_outputs[0])
-
-            hidden_states = hidden_states_out[0]  # type: ignore
-
-            if teacher_outputs is not None and output_hidden_states and layer_id != len(self.layers) - 1:
-                all_teacher_hidden_states += (hidden_states_out[1],)
-
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.final_layernorm(hidden_states)
-
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-            if teacher_outputs is not None:
-                all_teacher_hidden_states += (self.final_layernorm(hidden_states_out[1]),)
-
-        return HybridOutput(
-            last_hidden_state=hidden_states,
-            past_key_values=next_decoder_cache,
-            hidden_states=(all_hidden_states,all_teacher_hidden_states),
-            attentions=all_self_attns,
+        # if cache_position is None:
+        #     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        #     cache_position = torch.arange(
+        #         past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+        #     )
+        # if position_ids is None:
+        #     position_ids = cache_position.unsqueeze(0)
+        outputs = self.text_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        return SmolVLMBaseModelOutputWithPast(
+            last_hidden_state=outputs.last_hidden_state,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
             image_hidden_states=image_hidden_states,
         )
+        # # NEW VERSION FOR DISTILLATION
+        # hidden_states = inputs_embeds
+        # all_hidden_states = () if output_hidden_states else None
+        # all_teacher_hidden_states = (
+        # teacher_outputs[0],) if output_hidden_states and teacher_outputs is not None else None
+        # all_self_attns = () if output_attentions else None
+        # next_decoder_cache = None
+        # ## Build Position embeddings
+        # position_embeddings = self.text_model.rotary_emb(hidden_states,position_ids)
+        #
+        # mamba_layer_id = 0
+        # self.layers = self.text_model.layers
+        # for layer_id, decoder_layer in enumerate(self.layers):
+        #     if output_hidden_states:
+        #         all_hidden_states += (hidden_states,)
+        #     if isinstance(decoder_layer, HybridDecoderLayers):
+        #         mamba_layer_id += 1
+        #
+        #     hidden_states_run = [hidden_states]
+        #     if teacher_outputs is not None:
+        #         teacher_hidden_states = teacher_outputs[layer_id]
+        #         hidden_states_run.append(teacher_hidden_states)
+        #
+        #     hidden_states_out = []
+        #     for hidden_states_now in hidden_states_run:
+        #         if self.gradient_checkpointing and self.training and isinstance(decoder_layer, HybridDecoderLayers):
+        #             layer_outputs = self._gradient_checkpointing_func(
+        #                 decoder_layer.__call__,
+        #                 hidden_states_now,
+        #                 attention_mask,
+        #                 position_ids,
+        #                 past_key_values,
+        #                 output_attentions,
+        #                 use_cache,
+        #                 cache_position,
+        #             )
+        #         else:
+        #             layer_outputs = decoder_layer(
+        #                 hidden_states_now,
+        #                 attention_mask=attention_mask,
+        #                 position_ids=position_ids,
+        #                 past_key_value=past_key_values,
+        #                 output_attentions=output_attentions,
+        #                 use_cache=use_cache,
+        #                 cache_position=cache_position,
+        #                 position_embeddings=position_embeddings,
+        #             )
+        #         hidden_states_out.append(layer_outputs[0])
+        #
+        #     hidden_states = hidden_states_out[0]  # type: ignore
+        #
+        #     if teacher_outputs is not None and output_hidden_states and layer_id != len(self.layers) - 1:
+        #         all_teacher_hidden_states += (hidden_states_out[1],)
+        #
+        #     if use_cache:
+        #         next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+        #
+        #     if output_attentions:
+        #         all_self_attns += (layer_outputs[1],)
+        #
+        # hidden_states = self.final_layernorm(hidden_states)
+        #
+        # # add hidden states from the last decoder layer
+        # if output_hidden_states:
+        #     all_hidden_states += (hidden_states,)
+        #     if teacher_outputs is not None:
+        #         all_teacher_hidden_states += (self.final_layernorm(hidden_states_out[1]),)
+        #
+        # return HybridOutput(
+        #     last_hidden_state=hidden_states,
+        #     past_key_values=next_decoder_cache,
+        #     hidden_states=(all_hidden_states,all_teacher_hidden_states),
+        #     attentions=all_self_attns,
+        #     image_hidden_states=image_hidden_states,
+        # )
 
 
 class HybridOutputCausalLM(SmolVLMCausalLMOutputWithPast):
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[list[torch.FloatTensor]] = None
-    hidden_states: Optional[tuple[torch.FloatTensor],tuple[torch.FloatTensor]] = None
+    hidden_states: Optional[tuple[tuple[torch.FloatTensor, torch.FloatTensor], ...]] = None
     attentions: Optional[tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[tuple[torch.FloatTensor]] = None
 
@@ -189,7 +215,7 @@ class HybridSmolVLMForConditionalGeneration(SmolVLMForConditionalGeneration):
         super().__init__(config)
         self.model = Hybrid_SmolVLM(config)
 
-    @torch.no_grad()
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -208,7 +234,7 @@ class HybridSmolVLMForConditionalGeneration(SmolVLMForConditionalGeneration):
         return_dict: Optional[bool] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[tuple, HybridOutputCausalLM]:
+    ) -> Union[tuple, SmolVLMCausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -233,7 +259,10 @@ class HybridSmolVLMForConditionalGeneration(SmolVLMForConditionalGeneration):
             **kwargs,
         )
 
+
         hidden_states = outputs[0]
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = hidden_states[0]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -244,7 +273,7 @@ class HybridSmolVLMForConditionalGeneration(SmolVLMForConditionalGeneration):
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
 
-        return HybridOutputCausalLM(
+        return SmolVLMCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,

@@ -1,0 +1,59 @@
+HybridSmolVLMForConditionalGeneration(
+  (model): Hybrid_SmolVLM(
+    (vision_model): SmolVLMVisionTransformer(
+      (embeddings): SmolVLMVisionEmbeddings(
+        (patch_embedding): Conv2d(3, 1152, kernel_size=(14, 14), stride=(14, 14), padding=valid)
+        (position_embedding): Embedding(729, 1152)
+      )
+      (encoder): SmolVLMEncoder(
+        (layers): ModuleList(
+          (0-26): 27 x SmolVLMEncoderLayer(
+            (self_attn): SmolVLMVisionAttention(
+              (k_proj): Linear(in_features=1152, out_features=1152, bias=True)
+              (v_proj): Linear(in_features=1152, out_features=1152, bias=True)
+              (q_proj): Linear(in_features=1152, out_features=1152, bias=True)
+              (out_proj): Linear(in_features=1152, out_features=1152, bias=True)
+            )
+            (layer_norm1): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+            (mlp): SmolVLMVisionMLP(
+              (activation_fn): PytorchGELUTanh()
+              (fc1): Linear(in_features=1152, out_features=4304, bias=True)
+              (fc2): Linear(in_features=4304, out_features=1152, bias=True)
+            )
+            (layer_norm2): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+          )
+        )
+      )
+      (post_layernorm): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+    )
+    (connector): SmolVLMConnector(
+      (modality_projection): SmolVLMSimpleMLP(
+        (proj): Linear(in_features=10368, out_features=2048, bias=False)
+      )
+    )
+    (text_model): LlamaModel(
+      (embed_tokens): Embedding(49155, 2048, padding_idx=2)
+      (layers): ModuleList(
+        (0-23): 24 x LlamaDecoderLayer(
+          (self_attn): LlamaAttention(
+            (q_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+          )
+          (mlp): LlamaMLP(
+            (gate_proj): Linear(in_features=2048, out_features=8192, bias=False)
+            (up_proj): Linear(in_features=2048, out_features=8192, bias=False)
+            (down_proj): Linear(in_features=8192, out_features=2048, bias=False)
+            (act_fn): SiLU()
+          )
+          (input_layernorm): LlamaRMSNorm((2048,), eps=1e-05)
+          (post_attention_layernorm): LlamaRMSNorm((2048,), eps=1e-05)
+        )
+      )
+      (norm): LlamaRMSNorm((2048,), eps=1e-05)
+      (rotary_emb): LlamaRotaryEmbedding()
+    )
+  )
+  (lm_head): Linear(in_features=2048, out_features=49155, bias=False)
+)

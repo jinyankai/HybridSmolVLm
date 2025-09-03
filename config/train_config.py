@@ -1,13 +1,16 @@
 from dataclasses import asdict, dataclass, field
 from typing import Optional, List
+import torch
+
+
 # ----------------------------------
 # 1. Configuration
 # ----------------------------------
 @dataclass
 class TrainConfig:
     # I/O                                  # 仅 JSONL 数据时需要；Cauldron 可忽略
-    output: str = "/home/jinkaiyan/MaTVLM/smolVLM/outputs"
-    logging_dir: Optional[str] = "/home/jinkaiyan/MaTVLM/smolVLM/outputs/logs"
+    output: str = "/home/jinkaiyan/outputs/0903"
+    logging_dir: Optional[str] = "/home/jinkaiyan/outputs/logs"
 
     # Dataset meta
     dataset: str = "cauldron"     # ["cauldron", "jsonl"]
@@ -17,14 +20,19 @@ class TrainConfig:
     num_workers: int = 8
 
     # Optimisation
-    num_epochs: int = 3
-    lr: float = 5e-5
-    weight_decay: float = 0.05
-    batch_size: int = 4
+    num_epochs: int = 4
+    lr_scheduler_type: str = "linear"  # ["linear", "cosine", "cosine_w_restarts", "polynomial", "constant", "constant_with_warmup", "warmup_stable_decay"]
+    stable_steps: int = 1000
+    lr: float = 2e-4
+    weight_decay: float = 0.01
+    batch_size: int = 2
     grad_accum: int = 4
-    warmup_steps: int = 1000
-    max_steps: int = -1  # –1 => derived from epochs
-    seed: int = 42
+    warmup_steps: int = 50
+    num_decay_steps: int = 600  # if >0, overrides num_epochs
+    max_steps: int = -1
+    seed: int = 146  # 42
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
 
     # Distillation
     temperature: float = 1.0
@@ -35,7 +43,10 @@ class TrainConfig:
 
     # Model specifics
     teacher_name: str = "/home/jinkaiyan/MaTVLM/smolVLM/SmolVLM-Intruct"
-    ssm_layers: List[int] = field(default_factory=lambda: [0, 4, 8, 12, 16, 20])
+    check_point_path: str = "/home/jinkaiyan/outputs/0902/step_5000"
+    resume_from_checkpoint : bool = False
+    attn_layers: List[int] = field(default_factory=lambda: [4, 8, 12,  20])
+    dtype = torch.bfloat16
     bf16: bool = True
     grad_checkpoint: bool = True
 
