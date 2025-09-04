@@ -2,6 +2,7 @@ import math
 
 from dataset.cauldron import CauldronDataset,get_dataloader
 from config.train_config import TrainConfig
+from model.decoder_layer import HybridDecoderLayers
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
 from model.model_wrapper import HybridSmolVLMForConditionalGeneration,HybridSmolVLMWrapper
 from transformers import AutoProcessor, AutoTokenizer, logging as hf_logging, get_scheduler
@@ -31,7 +32,7 @@ def build_model(cfg:TrainConfig):
         intermediate_size=8192,
         hidden_act="silu",
         n_layer=24,
-        attn_layers=[0,1,2,3,5,6,7,9,10,11,13,14,15,16,17,18,19,21,22,23],
+        attn_layers=[0,1,2,3,5,6,7,9,10,11,12,13,14,15,17,18,19,21,22,23],
         resid_pdrop=0.1,
         bidirectional=False,
         is_bias=False
@@ -43,12 +44,23 @@ def build_model(cfg:TrainConfig):
                                                              dtype=cfg.dtype)
     student_model = student_wrapper.model
     student_model.gradient_checkpointing_enable()
-    for name, param in student_model.named_parameters():
-        if "mamba" in name:
-            param.requires_grad = True
-            print("name of the trainable param",name)
-        else:
-            param.requires_grad = False
+    for param in student_model.parameters():
+        param.requires_grad = False
+
+    # 2. 然后，通过遍历模块来精确地解冻需要的子模块
+    for module_name, module in student_model.named_modules():
+        # 检查当前模块的类型是否是我们的目标自定义层
+        if isinstance(module, HybridDecoderLayers):
+
+            print(f"✅ Found Hybrid Layer: '{module_name}'. Unfreezing its components.")
+
+            # 将该模块内的 mamba 和 mlp 的参数设为可训练
+            for sub_module_name, sub_module in module.named_children():
+                if sub_module_name == "self_attn_mamba" or sub_module_name == "mlp" or sub_module_name == "post_attention_layernorm" or sub_module_name == "input_layernorm":
+                    print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
+                    for param in sub_module.parameters():
+                        param.requires_grad = True
+
 
     logger.info("Successfully load Student, Building tok")
 
@@ -118,10 +130,10 @@ def main():
     max_steps = cfg.max_steps if cfg.max_steps > 0 else steps_per_epoch * cfg.num_epochs
 
     loss_config = DistillationLossConfig(
-        kl_weight=1.0,
-        l2_weight=0.5,
-        ce_weight=0.0,
-        temperature=1.0,
+        kl_weight=0.01,
+        l2_weight=1.0,
+        ce_weight=1.0,
+        temperature=6.0,
         l2_loss_layers=[4, 8, 12, 20]
     )
     distil_loss = VLMDitillationLoss(config=loss_config)
@@ -153,6 +165,7 @@ def main():
         accelerator.print("success in resuming！")
     else:
         accelerator.print("未找到 checkpoint, 从头开始训练。")
+
 
     if accelerator.is_main_process:
         from torch.utils.tensorboard import SummaryWriter
@@ -265,11 +278,13 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         out_dir = Path(cfg.output) / "final"
+        acc_out = Path(cfg.output)/ "last"
         #if path doesn't exist create one
         out_dir.mkdir(parents=True, exist_ok=True)
         unwrapped = accelerator.unwrap_model(student)  # <-- this is the right "unwrap"
         if hasattr(unwrapped, "save_pretrained"):
             unwrapped.save_pretrained(out_dir)
+            accelerator.save_state(output_dir=acc_out)
         else:
             accelerator.save(unwrapped.state_dict(), out_dir / "pytorch_model.bin")
         tok.save_pretrained(out_dir)

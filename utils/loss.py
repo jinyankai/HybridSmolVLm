@@ -4,6 +4,11 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import  List, Tuple
 
+def _standardize(h: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # h: [B, T, D]
+    mean = h.mean(dim=-1, keepdim=True)
+    var  = h.var(dim=-1, keepdim=True, unbiased=False)
+    return (h - mean) / (var + eps).sqrt()
 
 @dataclass
 class DistillationLossConfig:
@@ -112,12 +117,15 @@ class VLMDitillationLoss(nn.Module):
                 s_hidden = student_hidden_states[i]
                 t_hidden = teacher_hidden_states[i]
 
+
                 if s_hidden.shape != t_hidden.shape:
                     raise ValueError(
                         f"Student and Teacher hidden states for layer {i} must have the same shape. "
                         f"Got student: {s_hidden.shape}, teacher: {t_hidden.shape}"
                     )
-                total_l2_loss += self.l2_loss_fn(s_hidden, t_hidden)
+                s_h = _standardize(s_hidden)
+                t_h = _standardize(t_hidden)
+                total_l2_loss += self.l2_loss_fn(s_h, t_h)
 
         return total_l2_loss / num_layers_for_loss
 

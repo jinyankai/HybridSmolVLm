@@ -163,5 +163,8 @@ class HybridSmolVLMWrapper(nn.Module):
         config_path = os.path.join(save_directory, 'mamba_config.json')
         with open(config_path, 'w') as f:
             json.dump(self.mamba_config.__dict__, f, indent=4)
+        model_config_path = os.path.join(save_directory, 'model_config.json')
+        with open(model_config_path, 'w') as f:
+            json.dump(self.model.config.to_dict(), f, indent=4)
 
 
