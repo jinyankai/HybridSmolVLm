@@ -52,6 +52,7 @@ def run_test(device: str):
     )
     # student_model.gradie
     # print(student_model.model)
+    student_model.model.from_pretrained(model_name, torch_dtype=dtype, attn_implementation="flash_attention_2")
     student_model.train()  # Set to train mode for loss calculation
     student_model.to(device)
     print("Student model initialized successfully.")
@@ -68,7 +69,7 @@ def run_test(device: str):
     print("\n--- 2. Preparing dummy multimodal input ---")
     from transformers.image_utils import load_image
     dummy_image = load_image('/home/jinkaiyan/MaTVLM/smolVLM/images/bee.jpg')
-    dummy_prompt = "<image>\nThis is a test prompt for the model."
+    dummy_prompt = "<image>\nWhat is in the photo?."
 
     inputs = processor(text=[dummy_prompt],
                        images=[[dummy_image]], return_tensors="pt",padding=True).to(device)
@@ -138,7 +139,7 @@ def run_test(device: str):
     with torch.inference_mode():
         gen_ids = student_model.generate(
             **inputs,
-            max_new_tokens=20,
+            max_new_tokens=50,
             eos_token_id=processor.tokenizer.eos_token_id,
         )
 

@@ -1,6 +1,6 @@
 import math
 
-from dataset.cauldron import CauldronDataset,get_dataloader
+from dataset.cauldron import get_dataloader
 from config.train_config import TrainConfig
 from model.decoder_layer import HybridDecoderLayers
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
@@ -12,9 +12,8 @@ logger = logging.getLogger(__name__)
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 import torch
-import torch.nn as nn
+
 import argparse
-import torch.nn.functional as F
 from pathlib import Path
 
 def build_model(cfg:TrainConfig):
@@ -69,7 +68,7 @@ def build_model(cfg:TrainConfig):
         tok.pad_token = tok.eos_token
 
     logger.info("Processor")
-    processor = AutoProcessor.from_pretrained(cfg.teacher_name, local_files=True)
+    processor = AutoProcessor.from_pretrained(cfg.teacher_name, local_files_only=True)
 
     return teacher_model,student_wrapper,student_model,tok, processor
 
@@ -82,6 +81,8 @@ def evaluate(model, loader, accel: Accelerator):
             out = model(**batch)
             total += out.loss.float().item()
             n += 1
+            if n > 10:
+                break
     model.train()
     return total / max(n, 1)
 
@@ -125,33 +126,38 @@ def main():
     logger.info("Loading data")
 
     train_loader = get_dataloader(cfg,processor)
+    eval_loader = get_dataloader(cfg,processor)
 
     steps_per_epoch = math.ceil(len(train_loader) / cfg.grad_accum)
     max_steps = cfg.max_steps if cfg.max_steps > 0 else steps_per_epoch * cfg.num_epochs
 
     loss_config = DistillationLossConfig(
-        kl_weight=0.01,
+        kl_weight=1.0,
         l2_weight=1.0,
         ce_weight=1.0,
-        temperature=6.0,
-        l2_loss_layers=[4, 8, 12, 20]
+        temperature=2.0,
+        l2_loss_layers=[4, 8, 16, 20]
     )
-    distil_loss = VLMDitillationLoss(config=loss_config)
+    distil_loss = VLMDitillationLoss(config=loss_config, use_topk=True)
     # Optimiser & scheduler
     logger.info("Optimizer & Scheduler Setup")
-    no_decay = {"bias", "LayerNorm.weight"}
+    # no_decay = []
+    decay, no_decay = [], []
+    for n, p in student_model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_norm = ("norm" in n.lower()) or n.endswith(".bias")
+        (no_decay if is_norm else decay).append(p)
+
     optim_groups = [
-        {"params": [p for n, p in student_model.named_parameters() if
-                    p.requires_grad and not any(nd in n for nd in no_decay)],
-         "weight_decay": cfg.weight_decay},
-        {"params": [p for n, p in student_model.named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
-         "weight_decay": 0.0},
+        {"params": decay, "weight_decay": cfg.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
     ]
 
     optimizer = torch.optim.AdamW(optim_groups, lr=cfg.lr, betas=(cfg.adam_beta1, cfg.adam_beta2))
     scheduler = get_scheduler("cosine", optimizer,
                               num_warmup_steps=cfg.warmup_steps,
-                              num_training_steps=max_steps)
+                              num_training_steps=max_steps // cfg.num_epochs)
     # prepare
     logger.info("Prepare")
     teacher_model, student, optimizer, train_loader, scheduler = accelerator.prepare(
@@ -213,7 +219,8 @@ def main():
                     teacher_logits=t_out.logits,
                     student_ce_loss=s_out.loss,
                     teacher_hidden_states=t_out_h,
-                    student_hidden_states=student_hidden_states
+                    student_hidden_states=student_hidden_states,
+                    attention_mask=batch["attention_mask"],
                 )
 
             else:
@@ -225,7 +232,8 @@ def main():
                     teacher_logits=t_out.logits,
                     student_ce_loss=s_out.loss,
                     student_hidden_states=s_out.hidden_states,
-                    teacher_hidden_states=t_out.hidden_states
+                    teacher_hidden_states=t_out.hidden_states,
+                    attention_mask=batch["attention_mask"],
                 )
 
             # 应用梯度累积
@@ -236,6 +244,7 @@ def main():
                 running_losses[k] += v.item() / cfg.grad_accum
 
             if (step + 1) % cfg.grad_accum == 0:
+                accelerator.clip_grad_norm_(student.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -265,7 +274,7 @@ def main():
                     accelerator.save_state(path)
 
                 if cfg.eval_steps and global_step % cfg.eval_steps == 0:
-                    eval_loss = evaluate(student, None, accelerator)  # no val loader stub
+                    eval_loss = evaluate(student, eval_loader, accelerator)  # no val loader stub
                     if accelerator.is_main_process:
                         tbwriter.add_scalar('loss', eval_loss, global_step)
 

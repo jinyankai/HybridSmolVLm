@@ -1,15 +1,176 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from dataclasses import dataclass, field
-from typing import  List, Tuple
+from typing import Tuple, Optional, Sequence
 
 def _standardize(h: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    # h: [B, T, D]
     mean = h.mean(dim=-1, keepdim=True)
     var  = h.var(dim=-1, keepdim=True, unbiased=False)
     return (h - mean) / (var + eps).sqrt()
 
+class VLMDitillationLoss(nn.Module):
+    """
+    KL(teacher||student) + 同尺度 L2(选定层) + CE
+    - 支持 attention_mask：KL/L2 仅在有效 token 上平均
+    - 支持 Top-k KD（可开关）
+    - 内部用 fp32 计算，再 cast 回输入 dtype
+    - teacher hidden 在内部 detach
+    """
+
+    def __init__(self, config,
+                 use_topk: bool = False,
+                 k_top: int = 50,
+                 includes_embedding_slot: bool = True,
+                 z_loss_alpha: float = 0.0):
+        super().__init__()
+        self.config = config
+        self.use_topk = use_topk
+        self.k_top = k_top
+        self.includes_embedding_slot = includes_embedding_slot
+        self.z_loss_alpha = z_loss_alpha
+        self.mse = nn.MSELoss(reduction="none")  # 我们自己做按mask平均
+
+    # ---------- 公共入口 ----------
+    def forward(
+        self,
+        student_logits: torch.Tensor,           # [B,T,V] 或 [B,V]
+        teacher_logits: torch.Tensor,           # [B,T,V] 或 [B,V]
+        student_ce_loss: torch.Tensor,          # 标准 CE 已按 ignore_index 算好
+        student_hidden_states: Tuple[torch.Tensor, ...],  # 每层 [B,T,D]
+        teacher_hidden_states: Tuple[torch.Tensor, ...],
+        attention_mask: Optional[torch.Tensor] = None,    # [B,T] 0/1
+    ):
+        dtype_out = student_logits.dtype
+
+        # ---- KL (soft-CE) with temperature & token mask ----
+        T = float(self.config.temperature)
+        kd_loss = self._kd_loss_masked(student_logits, teacher_logits, attention_mask, T)
+
+        # ---- L2 on selected layers (standardized + mask) ----
+        l2_loss = self._multi_layer_l2_masked(
+            student_hidden_states, teacher_hidden_states, attention_mask,
+            layers=self.config.l2_loss_layers or [-1],
+            includes_embedding_slot=self.includes_embedding_slot
+        )
+
+        # ---- z-loss（可选）----
+        z_loss = self._z_loss(student_logits, attention_mask, alpha=self.z_loss_alpha)
+
+        # ---- 组合 ----
+        total = (
+            self.config.kl_weight * kd_loss +
+            self.config.l2_weight * l2_loss +
+            self.config.ce_weight * student_ce_loss +
+            z_loss
+        )
+
+        comps = {
+            "kl_loss": kd_loss.detach().to(dtype_out),
+            "l2_loss": l2_loss.detach().to(dtype_out),
+            "ce_loss": student_ce_loss.detach().to(dtype_out),
+            "z_loss": z_loss.detach().to(dtype_out),
+            "total_loss": total.detach().to(dtype_out),
+        }
+        return total.to(dtype_out), comps
+
+    # ---------- 细节实现 ----------
+    def _kd_loss_masked(self, logits_s, logits_t, attn_mask, T: float):
+        # 统一到 [B,T,V]
+        if logits_s.dim() == 2:
+            logits_s = logits_s.unsqueeze(1)
+            logits_t = logits_t.unsqueeze(1)
+            if attn_mask is None:
+                attn_mask = torch.ones(logits_s.size(0), 1, device=logits_s.device, dtype=torch.long)
+
+        # fp32 计算更稳
+        ls = logits_s.float() / T
+        lt = logits_t.float() / T
+
+        if self.use_topk:
+            # Top-k KD
+            val_t, idx_t = torch.topk(lt, k=min(self.k_top, lt.size(-1)), dim=-1)
+            with torch.no_grad():
+                q_top = torch.softmax(val_t, dim=-1)              # teacher 概率
+            sel = torch.gather(ls, -1, idx_t)
+            log_p_top = torch.log_softmax(sel, dim=-1)            # student log prob
+            per_tok = -(q_top * log_p_top).sum(dim=-1)            # [B,T]
+        else:
+            with torch.no_grad():
+                q = torch.softmax(lt, dim=-1)                     # teacher 概率
+            log_p = torch.log_softmax(ls, dim=-1)                 # student log prob
+            per_tok = -(q * log_p).sum(dim=-1)                    # [B,T]
+
+        if attn_mask is None:
+            return per_tok.mean() * (T * T)
+
+        valid = attn_mask.float()
+        denom = valid.sum().clamp_min(1.0)
+        return (per_tok * valid).sum() / denom * (T * T)
+
+    def _multi_layer_l2_masked(
+        self,
+        hs_s: Tuple[torch.Tensor, ...],
+        hs_t: Tuple[torch.Tensor, ...],
+        attn_mask: Optional[torch.Tensor],
+        layers: Sequence[int],
+        includes_embedding_slot: bool = True,
+        eps: float = 1e-6,
+    ):
+        # 统一：层索引 0-based；如包含 embedding 槽位，则实际访问 idx+1
+        L = len(hs_s) - (1 if includes_embedding_slot else 0)
+        # 处理负索引
+        abs_layers = []
+        for idx in layers:
+            if idx < 0:
+                idx = L + idx
+            if not (0 <= idx < L):
+                raise IndexError(f"L2 layer index {idx} out of range [0,{L-1}]")
+            abs_layers.append(idx)
+
+        off = 1 if includes_embedding_slot else 0
+        total, count = 0.0, 0
+
+        for idx in abs_layers:
+            s = hs_s[idx + off].float()
+            t = hs_t[idx + off].float().detach()
+
+            # [B,T,D] 约定；若 [B,D]，升成 [B,1,D]
+            if s.dim() == 2:
+                s = s.unsqueeze(1); t = t.unsqueeze(1)
+                if attn_mask is None:
+                    attn_mask = torch.ones(s.size(0), 1, device=s.device, dtype=torch.long)
+
+            s = _standardize(s, eps)
+            t = _standardize(t, eps)
+
+            # 先对 D 求均值 → [B,T]
+            mse_tok = self.mse(s, t).mean(dim=-1)
+
+            if attn_mask is not None:
+                valid = attn_mask.float()
+                denom = valid.sum().clamp_min(1.0)
+                loss_i = (mse_tok * valid).sum() / denom
+            else:
+                loss_i = mse_tok.mean()
+
+            total += loss_i
+            count += 1
+
+        return total / max(count, 1)
+
+    def _z_loss(self, logits_s, attn_mask, alpha: float = 0.0):
+        if alpha <= 0:
+            return logits_s.new_tensor(0.0)
+        if logits_s.dim() == 2:
+            logits_s = logits_s.unsqueeze(1)
+        z = torch.logsumexp(logits_s.float(), dim=-1)     # [B,T]
+        if attn_mask is None:
+            return (z.pow(2).mean()) * alpha
+        valid = attn_mask.float()
+        denom = valid.sum().clamp_min(1.0)
+        return ((z.pow(2) * valid).sum() / denom) * alpha
+
+from dataclasses import dataclass, field
+from typing import List
 @dataclass
 class DistillationLossConfig:
     """
@@ -34,153 +195,3 @@ class DistillationLossConfig:
         """Validate that the parameters are sensible."""
         if self.temperature <= 0:
             raise ValueError("Temperature must be positive.")
-
-
-class VLMDitillationLoss(nn.Module):
-    """
-    Implements a composite loss for teacher-student knowledge distillation in VLMs.
-    This version returns a loss tensor with the same dtype as the model's output (e.g., bfloat16),
-    trusting the Accelerator to handle the backward pass correctly.
-    """
-
-    def __init__(self, config: DistillationLossConfig):
-        """
-        Initializes the loss function with the given configuration.
-
-        Args:
-            config (DistillationLossConfig): An object containing the weights, temperature, and layer indices.
-        """
-        super().__init__()
-        self.config = config
-
-        self.kl_loss_fn = nn.KLDivLoss(reduction='batchmean')
-        self.l2_loss_fn = nn.MSELoss()
-
-    def forward(
-            self,
-            student_logits: torch.Tensor,
-            teacher_logits: torch.Tensor,
-            student_ce_loss: torch.Tensor,
-            student_hidden_states: Tuple[torch.Tensor, ...],
-            teacher_hidden_states: Tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """
-        Calculates the total distillation loss.
-        """
-        # 1. KL Divergence Loss with Temperature Scaling
-        soft_student_logits = F.log_softmax(student_logits / self.config.temperature, dim=-1)
-        soft_teacher_logits = F.softmax(teacher_logits / self.config.temperature, dim=-1)
-        kl_loss = self.kl_loss_fn(soft_student_logits, soft_teacher_logits) * (self.config.temperature ** 2)
-
-        # 2. L2 Distance Loss (MSE) on specified Hidden States
-        l2_loss = self._calculate_multi_layer_l2_loss(student_hidden_states, teacher_hidden_states)
-
-        # 3. Cross-Entropy Loss is passed in directly
-        ce_loss = student_ce_loss
-
-        # 4. Combine losses with weights.
-        #    NOTE: We are NOT casting to float32 here. We let the loss tensor remain in the
-        #    mixed-precision format (e.g., bfloat16) to allow `accelerate` to manage it.
-        total_loss = (
-                self.config.kl_weight * kl_loss +
-                self.config.l2_weight * l2_loss +
-                self.config.ce_weight * ce_loss
-        )
-
-        loss_components = {
-            'kl_loss': kl_loss.detach(),
-            'l2_loss': l2_loss.detach(),
-            'ce_loss': ce_loss.detach(),
-            'total_loss': total_loss.detach()  # This will now be bfloat16
-        }
-
-        return total_loss, loss_components
-
-    def _calculate_multi_layer_l2_loss(
-            self,
-            student_hidden_states: Tuple[torch.Tensor, ...],
-            teacher_hidden_states: Tuple[torch.Tensor, ...]
-    ) -> torch.Tensor:
-        """Helper function to compute the L2 loss across specified layers."""
-        if not isinstance(student_hidden_states, (list, tuple)) or not isinstance(teacher_hidden_states, (list, tuple)):
-            raise TypeError("Hidden states must be provided as a list or tuple of tensors.")
-
-        layer_indices = self.config.l2_loss_layers if self.config.l2_loss_layers else [-1]
-
-        num_layers_for_loss = len(layer_indices)
-        if num_layers_for_loss == 0:
-            return torch.tensor(0.0, device=student_hidden_states[0].device)
-
-        total_l2_loss = torch.tensor(0.0, device=student_hidden_states[0].device, dtype=student_hidden_states[0].dtype)
-        for i in range(1, len(teacher_hidden_states)):
-            if i - 1 in layer_indices:
-                s_hidden = student_hidden_states[i]
-                t_hidden = teacher_hidden_states[i]
-
-
-                if s_hidden.shape != t_hidden.shape:
-                    raise ValueError(
-                        f"Student and Teacher hidden states for layer {i} must have the same shape. "
-                        f"Got student: {s_hidden.shape}, teacher: {t_hidden.shape}"
-                    )
-                s_h = _standardize(s_hidden)
-                t_h = _standardize(t_hidden)
-                total_l2_loss += self.l2_loss_fn(s_h, t_h)
-
-        return total_l2_loss / num_layers_for_loss
-
-
-# ================== Example Usage ==================
-if __name__ == '__main__':
-    # This example requires a CUDA device to test bfloat16
-    if torch.cuda.is_available():
-        # Configuration
-        batch_size = 8
-        num_classes = 100
-        hidden_dim = 768
-        num_hidden_layers = 12
-
-        loss_config = DistillationLossConfig(
-            kl_weight=0.6,
-            l2_weight=0.1,
-            ce_weight=0.3,
-            temperature=2.5,
-            l2_loss_layers=[0, 6, -1]
-        )
-        distil_loss = VLMDitillationLoss(config=loss_config)
-
-        # Simulate model outputs in bfloat16 by explicitly setting the dtype of dummy tensors.
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            with torch.no_grad():
-                t_out_logits = torch.randn(batch_size, num_classes, device='cuda', dtype=torch.bfloat16)
-                t_out_hidden_states = tuple(
-                    torch.randn(batch_size, hidden_dim, device='cuda', dtype=torch.bfloat16) for _ in
-                    range(num_hidden_layers))
-
-            s_out_logits = torch.randn(batch_size, num_classes, device='cuda', dtype=torch.bfloat16, requires_grad=True)
-            s_out_hidden_states = tuple(
-                torch.randn(batch_size, hidden_dim, device='cuda', dtype=torch.bfloat16, requires_grad=True) for _ in
-                range(num_hidden_layers))
-            s_out_loss = torch.tensor(1.2345, device='cuda', dtype=torch.bfloat16)  # Dummy scalar loss
-
-            print(f"Input dtypes: s_out_logits={s_out_logits.dtype}, s_out_loss={s_out_loss.dtype}")
-
-            total_loss, loss_components = distil_loss(
-                student_logits=s_out_logits,
-                teacher_logits=t_out_logits,
-                student_ce_loss=s_out_loss,
-                student_hidden_states=s_out_hidden_states,
-                teacher_hidden_states=t_out_hidden_states
-            )
-
-        print(f"\nOutput total_loss dtype: {total_loss.dtype}")  # Should be torch.bfloat16
-        assert total_loss.dtype == torch.bfloat16
-
-        print("\nCalculated Losses:")
-        for name, value in loss_components.items():
-            print(f"  - {name:<12}: {value.item():.4f} (dtype: {value.dtype})")
-
-        print("\nBackward pass should now succeed in a real training script.")
-        print("Test case passed!")
-    else:
-        print("CUDA not available, skipping bfloat16 test case.")

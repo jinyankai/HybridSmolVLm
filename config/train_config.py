@@ -9,7 +9,7 @@ import torch
 @dataclass
 class TrainConfig:
     # I/O                                  # 仅 JSONL 数据时需要；Cauldron 可忽略
-    output: str = "/home/jinkaiyan/outputs/0904"
+    output: str = "/home/jinkaiyan/outputs/0905"
     logging_dir: Optional[str] = "/home/jinkaiyan/outputs/0905/logs"
 
     # Dataset meta
@@ -43,8 +43,8 @@ class TrainConfig:
 
     # Model specifics
     teacher_name: str = "/home/jinkaiyan/MaTVLM/smolVLM/SmolVLM-Intruct"
-    check_point_path: str = "/home/jinkaiyan/outputs/0904/step_2500"
-    resume_from_checkpoint : bool = True
+    check_point_path: str = "/home/jinkaiyan/outputs/0905/step_2500"
+    resume_from_checkpoint : bool = False
     attn_layers: List[int] = field(default_factory=lambda: [4, 8, 16,  20])
     dtype = torch.bfloat16
     bf16: bool = True
