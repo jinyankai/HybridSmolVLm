@@ -1,6 +1,8 @@
 import math
-
+import os
+os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 from dataset.cauldron import get_dataloader
+from dataset.sharegpt4v import make_supervised_data_module,DataArguments
 from config.train_config import TrainConfig
 from model.decoder_layer import HybridDecoderLayers
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
@@ -12,6 +14,7 @@ logger = logging.getLogger(__name__)
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 import torch
+from torch.utils.data import DataLoader
 
 import argparse
 from pathlib import Path
@@ -97,10 +100,14 @@ def parse_args() -> TrainConfig:
 
 def main():
     cfg = parse_args()
+    data_args = DataArguments(
+        data_path="/data/jyk_data/data/sharegpt4v/cleaned_sharegpt4v_mix665k_cap23k_coco-ap9k_lcs3k_sam9k_div2k.json",
+        image_folder="/data/jyk_data/data/"
+    )
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     hf_logging.set_verbosity_error()
 
-    accelerator = Accelerator(log_with="tensorboard", project_dir=cfg.logging_dir)
+    accelerator = Accelerator(log_with="tensorboard", project_dir=cfg.logging_dir,gradient_accumulation_steps=cfg.grad_accum)
     set_seed(cfg.seed)
 
     accelerator.wait_for_everyone()
@@ -125,17 +132,20 @@ def main():
         student_wrapper.save_config(cfg.output)
     logger.info("Loading data")
 
-    train_loader = get_dataloader(cfg,processor)
-    eval_loader = get_dataloader(cfg,processor)
-
+    # train_loader= get_dataloader(cfg,processor)
+    # eval_loader= get_dataloader(cfg,processor)
+    train_dict = make_supervised_data_module(processor=processor,
+                                                               data_args=data_args)
+    train_loader = DataLoader(dataset=train_dict['train_dataset'],batch_size=cfg.batch_size,
+                              shuffle=True,num_workers=cfg.num_workers,collate_fn=train_dict['data_collator'],pin_memory=True )
     steps_per_epoch = math.ceil(len(train_loader) / cfg.grad_accum)
     max_steps = cfg.max_steps if cfg.max_steps > 0 else steps_per_epoch * cfg.num_epochs
 
     loss_config = DistillationLossConfig(
-        kl_weight=1.0,
-        l2_weight=1.0,
-        ce_weight=1.0,
-        temperature=2.0,
+        kl_weight=0.1,
+        l2_weight=0.1,
+        ce_weight=2.0,
+        temperature=1.0,
         l2_loss_layers=[4, 8, 16, 20]
     )
     distil_loss = VLMDitillationLoss(config=loss_config, use_topk=True)
@@ -193,21 +203,14 @@ def main():
         running_losses = collections.defaultdict(float)
 
         for step, batch in enumerate(train_loader):
-            ids = batch["input_ids"].to(accelerator.device, non_blocking=True)
-            attn = batch["attention_mask"].to(accelerator.device, non_blocking=True)
-            labels = batch["labels"].to(accelerator.device, non_blocking=True)
-            images = batch["pixel_values"].to(
-                accelerator.device,
-                dtype=torch.bfloat16 if cfg.bf16 else torch.float16,
-                non_blocking=True,
-            )
+            batch = {k: (v.to(accelerator.device, non_blocking=True) if hasattr(v, "to") else v)
+                     for k, v in batch.items()}
 
-            batch = {
-                "input_ids": ids,  # still int64
-                "attention_mask": attn,  # int64
-                "labels": labels,  # int64
-                "pixel_values": images,  # bf16 / fp16
-            }
+            # 然后正常取
+            input_ids = batch.get("input_ids", None)
+            attention_mask = batch.get("attention_mask", None)
+            pixel_values = batch.get("pixel_values", None)
+            pixel_attention_mask = batch.get("pixel_attention_mask", None)
             if loss_config.l2_weight > 0:
                 with torch.no_grad():
                     t_out = teacher_model(**batch, output_hidden_states=True)
@@ -257,7 +260,9 @@ def main():
                         kl=running_losses['kl_loss'] / global_step,
                         l2=running_losses['l2_loss'] / global_step,
                         ce=running_losses['ce_loss'] / global_step,
-                        lr=scheduler.get_last_lr()[0]
+                        # z_loss=running_losses['z_loss']
+                        lr=scheduler.get_last_lr()[0],
+                        step= global_step
                     )
 
                     # 4. 按 global_step 记录到TensorBoard
@@ -271,12 +276,14 @@ def main():
                 # 保存模型检查点
                 if cfg.save_steps and global_step % cfg.save_steps == 0:
                     path = Path(cfg.output) / f"step_{global_step}"
+                    path_1 = Path(cfg.output) / f"step_{global_step}_1"
                     accelerator.save_state(path)
+                    accelerator.unwrap_model(student).save_pretrained(path_1)
 
-                if cfg.eval_steps and global_step % cfg.eval_steps == 0:
-                    eval_loss = evaluate(student, eval_loader, accelerator)  # no val loader stub
-                    if accelerator.is_main_process:
-                        tbwriter.add_scalar('loss', eval_loss, global_step)
+                # if cfg.eval_steps and global_step % cfg.eval_steps == 0:
+                #     eval_loss = evaluate(student, eval_loader, accelerator)  # no val loader stub
+                #     if accelerator.is_main_process:
+                #         tbwriter.add_scalar('loss', eval_loss, global_step)
 
             if global_step >= max_steps:
                 break
@@ -290,10 +297,10 @@ def main():
         acc_out = Path(cfg.output)/ "last"
         #if path doesn't exist create one
         out_dir.mkdir(parents=True, exist_ok=True)
+        accelerator.save_state(output_dir=acc_out)
         unwrapped = accelerator.unwrap_model(student)  # <-- this is the right "unwrap"
         if hasattr(unwrapped, "save_pretrained"):
             unwrapped.save_pretrained(out_dir)
-            accelerator.save_state(output_dir=acc_out)
         else:
             accelerator.save(unwrapped.state_dict(), out_dir / "pytorch_model.bin")
         tok.save_pretrained(out_dir)

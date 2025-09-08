@@ -7,15 +7,15 @@ import torch
 # 1. Configuration
 # ----------------------------------
 @dataclass
-class TrainConfig:
+class TestConfig:
     # I/O                                  # 仅 JSONL 数据时需要；Cauldron 可忽略
-    output: str = "/home/jinkaiyan/outputs/0907"
-    logging_dir: Optional[str] = "/home/jinkaiyan/outputs/0907/logs"
+    output: str = "/home/jinkaiyan/outputs/0905"
+    logging_dir: Optional[str] = "/home/jinkaiyan/outputs/0905/logs"
 
     # Dataset meta
     dataset: str = "HuggingFaceM4/the_cauldron"     # ["cauldron", "jsonl"]
     subset:  str = "vqav2"
-    split:   str = "train"        # HuggingFace Datasets split argument
+    split:   str = "train[:10]"        # HuggingFace Datasets split argument
     streaming: bool = False       # True → iterable dataset
     num_workers: int = 8
 
@@ -23,11 +23,11 @@ class TrainConfig:
     num_epochs: int = 4
     lr_scheduler_type: str = "linear"  # ["linear", "cosine", "cosine_w_restarts", "polynomial", "constant", "constant_with_warmup", "warmup_stable_decay"]
     stable_steps: int = 1000
-    lr: float = 2e-5
+    lr: float = 2e-4
     weight_decay: float = 0.01
     batch_size: int = 1
-    grad_accum: int = 8
-    warmup_steps: int = 500
+    grad_accum: int = 4
+    warmup_steps: int = 50
     num_decay_steps: int = 600  # if >0, overrides num_epochs
     max_steps: int = -1
     seed: int = 146  # 42
@@ -42,8 +42,8 @@ class TrainConfig:
     mse_weight: float = 0.0  # hidden‑state alignment
 
     # Model specifics
-    teacher_name: str = "HuggingFaceTB/SmolVLM-Instruct"  # Teacher model name
-    check_point_path: str = "/home/jinkaiyan/outputs/0906/step_5000"
+    teacher_name: str = "HuggingFaceTB/SmolVLM-Instruct"
+    check_point_path: str = "/home/jinkaiyan/outputs/0905/step_2500"
     resume_from_checkpoint : bool = True
     attn_layers: List[int] = field(default_factory=lambda: [4, 8, 16,  20])
     dtype = torch.bfloat16

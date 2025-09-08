@@ -18,7 +18,10 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
+import os
+os.environ.pop("HF_DATASETS_OFFLINE", None)
+os.environ.pop("HF_HUB_OFFLINE", None)
+os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 
 # ────────────────────────────────────────────────────────────────────────────────
 # helper
@@ -34,12 +37,13 @@ def _build_prompt(texts: List[str | Dict[str, str]], image_tok: str = "<image>")
     return f"{image_tok}\n{user}"
 
 
+
+
 # ────────────────────────────────────────────────────────────────────────────────
 # dataset
 # ────────────────────────────────────────────────────────────────────────────────
 class CauldronDataset(Dataset):
-    """Always take **only the first image** in each sample and flatten any
-    surplus leading dims returned by the processor (e.g. `(1,13,3,H,W)`)."""
+
 
     def __init__(
             self,
@@ -55,6 +59,7 @@ class CauldronDataset(Dataset):
             split=split,
             streaming=streaming,
             num_proc=None if streaming else 8,
+            cache_dir="/home/jinkaiyan/.cache/huggingface/datasets/"
         )
         if not hasattr(processor, "tokenizer"):
             raise ValueError("`processor` must expose .tokenizer")
@@ -79,7 +84,6 @@ class CauldronDataset(Dataset):
             images=img,
             text=prompt,
             return_tensors="pt",
-            padding=False,
         )
         # pix = enc["pixel_value"]
         # remove first d
@@ -135,7 +139,7 @@ class TrainConfig:
 
 
 def get_dataloader(cfg: TrainConfig, processor: ProcessorMixin) -> DataLoader:
-    if cfg.dataset.lower() != "cauldron":
+    if "cauldron" not in cfg.dataset.lower():
         raise ValueError("Only 'cauldron' handled here.")
 
     ds = CauldronDataset(
@@ -188,3 +192,9 @@ def pad_pixel_values(batch_pixel_values):
 
     # 将填充后的样本堆叠成一个张量
     return torch.cat(padded_batch, dim=0)
+
+
+def download_cauldron_dataset():
+    """Download the Cauldron dataset to the local cache."""
+    load_dataset("HuggingFaceM4/the_cauldron", "vqav2", split="train", streaming=False, num_proc=8)
+    print("Cauldron dataset downloaded and cached.")

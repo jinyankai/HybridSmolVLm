@@ -38,6 +38,7 @@ def run_test(device: str):
     # =========================================================================
     print(f"\n--- 1. Initializing models and processor from '{model_name}' ---")
     processor = AutoProcessor.from_pretrained(model_name, local_files_only=True, trust_remote_code=True)
+    print(processor)
     # processor.to(device)
 
     # Initialize Student Model (with Mamba layers)
