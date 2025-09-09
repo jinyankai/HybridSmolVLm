@@ -113,22 +113,43 @@ def main():
     accelerator.wait_for_everyone()
     teacher_model, student_wrapper,student_model,tok,processor = build_model(cfg)
     if accelerator.is_main_process:
-        print("teacher_model:", teacher_model)
-        total_params = sum(p.numel() for p in teacher_model.parameters())
-        total_trainable_params = sum(
-            p.numel() for p in teacher_model.parameters() if p.requires_grad)
-        print(f"number of total params:{total_params}")
-        print(f"number of total trainable params:{total_trainable_params}")
+        report_path = "params_report.txt"
+        with open(report_path, "w", encoding="utf-8") as f:
 
-        print("student_model:", student_model)
-        total_params = sum(p.numel() for p in student_model.parameters())
-        total_trainable_params = sum(
-            p.numel() for p in student_model.parameters() if p.requires_grad)
-        print(f"number of total params:{total_params}")
-        print(f"number of total trainable params:{total_trainable_params}")
-        for name, param in student_model.named_parameters():
-            if param.requires_grad:
-                print(f"Parameter: {name}, requires_grad: {param.requires_grad}")
+            # teacher
+            print("teacher_model:", teacher_model)
+            f.write(f"teacher_model: {teacher_model}\n")
+
+            total_params = sum(p.numel() for p in teacher_model.parameters())
+            total_trainable_params = sum(
+                p.numel() for p in teacher_model.parameters() if p.requires_grad)
+
+            print(f"number of total params:{total_params}")
+            print(f"number of total trainable params:{total_trainable_params}")
+            f.write(f"number of total params: {total_params}\n")
+            f.write(f"number of total trainable params: {total_trainable_params}\n\n")
+
+            # student
+            print("student_model:", student_model)
+            f.write(f"student_model: {student_model}\n")
+
+            total_params = sum(p.numel() for p in student_model.parameters())
+            total_trainable_params = sum(
+                p.numel() for p in student_model.parameters() if p.requires_grad)
+
+            print(f"number of total params:{total_params}")
+            print(f"number of total trainable params:{total_trainable_params}")
+            f.write(f"number of total params: {total_params}\n")
+            f.write(f"number of total trainable params: {total_trainable_params}\n\n")
+
+            # 每个参数
+            for name, param in student_model.named_parameters():
+                if param.requires_grad:
+                    print(f"Parameter: {name}, requires_grad: {param.requires_grad}")
+                    f.write(f"Parameter: {name}, requires_grad: {param.requires_grad}\n")
+
+        print(f"参数信息已保存到 {report_path}")
+
         student_wrapper.save_config(cfg.output)
     logger.info("Loading data")
 
@@ -142,9 +163,9 @@ def main():
     max_steps = cfg.max_steps if cfg.max_steps > 0 else steps_per_epoch * cfg.num_epochs
 
     loss_config = DistillationLossConfig(
-        kl_weight=0.1,
-        l2_weight=0.1,
-        ce_weight=2.0,
+        kl_weight=1.,
+        l2_weight=1.0,
+        ce_weight=1.0,
         temperature=1.0,
         l2_loss_layers=[4, 8, 16, 20]
     )
@@ -206,11 +227,8 @@ def main():
             batch = {k: (v.to(accelerator.device, non_blocking=True) if hasattr(v, "to") else v)
                      for k, v in batch.items()}
 
-            # 然后正常取
-            input_ids = batch.get("input_ids", None)
-            attention_mask = batch.get("attention_mask", None)
-            pixel_values = batch.get("pixel_values", None)
-            pixel_attention_mask = batch.get("pixel_attention_mask", None)
+
+            kd_mask = (batch['labels'] != -100).to(torch.long)
             if loss_config.l2_weight > 0:
                 with torch.no_grad():
                     t_out = teacher_model(**batch, output_hidden_states=True)
@@ -223,7 +241,7 @@ def main():
                     student_ce_loss=s_out.loss,
                     teacher_hidden_states=t_out_h,
                     student_hidden_states=student_hidden_states,
-                    attention_mask=batch["attention_mask"],
+                    attention_mask=kd_mask,
                 )
 
             else:
@@ -236,7 +254,7 @@ def main():
                     student_ce_loss=s_out.loss,
                     student_hidden_states=s_out.hidden_states,
                     teacher_hidden_states=t_out.hidden_states,
-                    attention_mask=batch["attention_mask"],
+                    attention_mask=kd_mask,
                 )
 
             # 应用梯度累积

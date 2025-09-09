@@ -47,7 +47,7 @@ class VLMDitillationLoss(nn.Module):
 
         # ---- L2 on selected layers (standardized + mask) ----
         l2_loss = self._multi_layer_l2_masked(
-            student_hidden_states, teacher_hidden_states, attention_mask,
+            student_hidden_states, teacher_hidden_states, None,
             layers=self.config.l2_loss_layers or [-1],
             includes_embedding_slot=self.includes_embedding_slot
         )
@@ -107,46 +107,79 @@ class VLMDitillationLoss(nn.Module):
         return (per_tok * valid).sum() / denom * (T * T)
 
     def _multi_layer_l2_masked(
-        self,
-        hs_s: Tuple[torch.Tensor, ...],
-        hs_t: Tuple[torch.Tensor, ...],
-        attn_mask: Optional[torch.Tensor],
-        layers: Sequence[int],
-        includes_embedding_slot: bool = True,
-        eps: float = 1e-6,
+            self,
+            hs_s: Tuple[torch.Tensor, ...],
+            hs_t: Tuple[torch.Tensor, ...],
+            kd_mask: Optional[torch.Tensor],  # 建议用 (labels != -100).to(dtype)
+            layers: Sequence[int],
+            includes_embedding_slot: bool = True,
+            eps: float = 1e-6,
     ):
-        # 统一：层索引 0-based；如包含 embedding 槽位，则实际访问 idx+1
+        """
+        对多层 hidden state 做 token-wise 标准化后 L2 (MSE) 蒸馏。
+        - hs_*: 每个元素形状约定为 [B, T, D]，若为 [B, D] 会在内部升维到 [B,1,D]
+        - kd_mask: [B, T]，1 表示参与蒸馏、0 表示跳过（请勿使用 raw attention_mask）
+        - layers: 使用 0-based 的 block 索引；若 includes_embedding_slot=True，则会在访问时 +1
+        """
+        # 计算可用 block 层数（不含 embedding 槽位）
         L = len(hs_s) - (1 if includes_embedding_slot else 0)
-        # 处理负索引
+
+        # 处理负索引并边界检查
         abs_layers = []
         for idx in layers:
             if idx < 0:
                 idx = L + idx
             if not (0 <= idx < L):
-                raise IndexError(f"L2 layer index {idx} out of range [0,{L-1}]")
+                raise IndexError(f"L2 layer index {idx} out of range [0,{L - 1}]")
             abs_layers.append(idx)
 
         off = 1 if includes_embedding_slot else 0
         total, count = 0.0, 0
 
         for idx in abs_layers:
-            s = hs_s[idx + off].float()
-            t = hs_t[idx + off].float().detach()
+            s = hs_s[idx + off]
+            t = hs_t[idx + off].detach()
 
-            # [B,T,D] 约定；若 [B,D]，升成 [B,1,D]
+            # 统一到 [B,T,D]
             if s.dim() == 2:
-                s = s.unsqueeze(1); t = t.unsqueeze(1)
-                if attn_mask is None:
-                    attn_mask = torch.ones(s.size(0), 1, device=s.device, dtype=torch.long)
+                s = s.unsqueeze(1)  # [B,1,D]
+            if t.dim() == 2:
+                t = t.unsqueeze(1)
 
-            s = _standardize(s, eps)
-            t = _standardize(t, eps)
+            # 显式断言形状一致（至少 B,T 一致）
+            assert s.shape[:2] == t.shape[:2], f"Hidden state shape mismatch at layer {idx}: {s.shape} vs {t.shape}"
 
-            # 先对 D 求均值 → [B,T]
-            mse_tok = self.mse(s, t).mean(dim=-1)
+            # 本层使用局部 mask，避免修改外部 kd_mask
+            if kd_mask is not None:
+                local_mask = kd_mask
+                if local_mask.dim() == 1:
+                    local_mask = local_mask.unsqueeze(1)  # [B] -> [B,1]
+                # 若当前层的 T 与 mask 不一致，尝试截断到最小长度（更稳妥是保证预处理阶段严格对齐）
+                if local_mask.size(1) != s.size(1):
+                    T_min = min(local_mask.size(1), s.size(1))
+                    s = s[:, :T_min]
+                    t = t[:, :T_min]
+                    local_mask = local_mask[:, :T_min]
+            else:
+                local_mask = None
 
-            if attn_mask is not None:
-                valid = attn_mask.float()
+            # 数值稳定与尺度对齐（最后一维 D 上标准化）
+            s = s.float()
+            t = t.float()
+
+            s_mean = s.mean(dim=-1, keepdim=True)
+            t_mean = t.mean(dim=-1, keepdim=True)
+            s_std = s.std(dim=-1, keepdim=True).clamp_min(eps)
+            t_std = t.std(dim=-1, keepdim=True).clamp_min(eps)
+            s = (s - s_mean) / s_std
+            t = (t - t_mean) / t_std
+
+            # token 级 MSE -> [B,T]
+            mse_tok = (s - t).pow(2).mean(dim=-1)
+
+            # 掩码聚合
+            if local_mask is not None:
+                valid = local_mask.to(mse_tok.dtype)
                 denom = valid.sum().clamp_min(1.0)
                 loss_i = (mse_tok * valid).sum() / denom
             else:

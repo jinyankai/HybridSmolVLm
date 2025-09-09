@@ -24,7 +24,7 @@ class HybridSmolVLMWrapper(nn.Module):
         self.mamba_config = mamba_config
         self.attn_layers = attn_layers
         self.dtype = dtype
-        self.model = base_model
+        self.model : HybridSmolVLMForConditionalGeneration = base_model
         self.config = self.model.config
         self.layers = self.model.model.text_model.layers
 
@@ -166,5 +166,14 @@ class HybridSmolVLMWrapper(nn.Module):
         model_config_path = os.path.join(save_directory, 'model_config.json')
         with open(model_config_path, 'w') as f:
             json.dump(self.model.config.to_dict(), f, indent=4)
+
+    def from_pretrain(self, checkpoint_path, torch_dtype=torch.bfloat16):
+        if os.path.exists(f"{checkpoint_path}/pytorch_model.bin"):
+            # support save from bin file
+            self.model.load_state_dict(
+                torch.load(f"{checkpoint_path}/pytorch_model.bin", map_location=torch.device("cpu"), dtype=torch_dtype))
+        else:
+            # support save from safetensors
+            self.model.load_state_dict(load_safetensors_to_dict(checkpoint_path))
 
 

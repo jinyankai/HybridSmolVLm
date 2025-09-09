@@ -9,17 +9,13 @@ from config.test_config import TestConfig
 from model.decoder_layer import HybridDecoderLayers
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
 from model.model_wrapper import HybridSmolVLMForConditionalGeneration,HybridSmolVLMWrapper
-from transformers import AutoProcessor, AutoTokenizer, AutoModelForImageTextToText, logging as hf_logging, get_scheduler
-from utils.loss import VLMDitillationLoss,DistillationLossConfig
+from transformers import AutoProcessor, AutoTokenizer
 import logging
 logger = logging.getLogger(__name__)
-from accelerate import Accelerator
-from accelerate.utils import set_seed
 import torch
-import torch.nn as nn
 import argparse
 from transformers.image_utils  import load_image
-from dataset.sharegpt4v import make_supervised_data_module,DataArguments
+
 
 def build_model(cfg:TestConfig):
     # Prepare Teacher Model
@@ -47,9 +43,7 @@ def build_model(cfg:TestConfig):
                                                              attn_layers=mamba_cfg.attn_layers,
                                                              dtype=cfg.dtype)
     student_model = student_wrapper.model
-    student_model.from_pretrain(cfg.check_point_path,torch_dtype = cfg.dtype)
-
-
+    student_wrapper.from_pretrain(cfg.check_point_path)
     logger.info("Successfully load Student, Building tok")
 
     tok = AutoTokenizer.from_pretrained(cfg.teacher_name, local_files_only=True, use_fast=True)
@@ -61,19 +55,6 @@ def build_model(cfg:TestConfig):
 
     return teacher_model,student_wrapper,student_model,tok, processor
 
-def evaluate(model, loader, accel: Accelerator):
-    model.eval()
-    total, n = 0.0, 0
-    with torch.no_grad():
-        for batch in loader or []:
-            batch = {k: v.to(accel.device) for k, v in batch.items() if torch.is_tensor(v)}
-            out = model(**batch)
-            total += out.loss.float().item()
-            n += 1
-            if n > 10:
-                break
-    model.train()
-    return total / max(n, 1)
 
 def parse_args() -> TestConfig:
     p = argparse.ArgumentParser()

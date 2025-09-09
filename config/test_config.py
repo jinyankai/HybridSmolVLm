@@ -43,7 +43,7 @@ class TestConfig:
 
     # Model specifics
     teacher_name: str = "HuggingFaceTB/SmolVLM-Instruct"
-    check_point_path: str = "/home/jinkaiyan/outputs/0905/step_2500"
+    check_point_path: str = "/home/jinkaiyan/outputs/0907/step_10000"
     resume_from_checkpoint : bool = True
     attn_layers: List[int] = field(default_factory=lambda: [4, 8, 16,  20])
     dtype = torch.bfloat16
