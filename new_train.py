@@ -1,15 +1,11 @@
 import math
-
 import os
-
-from exceptiongroup import catch
-
 os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 from dataset.sharegpt4v import make_supervised_data_module,DataArguments
 from config.train_config import TrainConfig
 from model.decoder_layer import HybridDecoderLayers
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
-from model.model_wrapper import HybridSmolVLMForConditionalGeneration,HybridSmolVLMWrapper
+from model.model_wrapper import HybridSmolVLMWrapper
 from transformers import AutoProcessor, AutoTokenizer, logging as hf_logging, get_scheduler
 from utils.loss import VLMDitillationLoss,DistillationLossConfig
 import logging
@@ -20,34 +16,37 @@ import torch
 from torch.utils.data import DataLoader
 
 import argparse
-from pathlib import Path
 
 def build_model(cfg:TrainConfig):
     # Prepare Teacher Model
-    teacher_model = HybridSmolVLMForConditionalGeneration.from_pretrained(cfg.teacher_name,torch_dtype=cfg.dtype)
-    for param in teacher_model.parameters():
-        param.requires_grad = False
-    logger.log(logging.INFO, f"Teacher model {cfg.teacher_name} loaded successfully.")
+    # teacher_model = HybridSmolVLMForConditionalGeneration.from_pretrained(cfg.teacher_name,torch_dtype=cfg.dtype)
+    # for param in teacher_model.parameters():
+    #     param.requires_grad = False
+    # logger.log(logging.INFO, f"Teacher model {cfg.teacher_name} loaded successfully.")
     mamba_cfg = PhiMambaConfig(
         d_model=576,
-        ssm_cfg={"expand": 1, "ngroups": 9, "d_state": 64, "d_conv": 4},
+        ssm_cfg={"expand": 1, "ngroups":9, "d_state": 64,"d_conv": 4},
         rms_norm_eps=1e-05,
         d_inner=576,
         d_xb=192,
         intermediate_size=1536,
         hidden_act="silu",
         n_layer=30,
-        attn_layers=[1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29],
+        attn_layers=[1,2,3,4,5,7,8,9,10,11,13,14,15,16,17,19,20,21,22,23,24,25,26,27,28,29],
         resid_pdrop=0.1,
         bidirectional=False,
         is_bias=False
-    )
+        )
     student_wrapper = HybridSmolVLMWrapper.init_distillation(checkpoint_path=None,
                                                              tranformer_name=cfg.teacher_name,
                                                              mamba_config=mamba_cfg,
                                                              attn_layers=mamba_cfg.attn_layers,
                                                              dtype=cfg.dtype)
     student_model = student_wrapper.model
+    # if cfg.resume_from_checkpoint:
+    #     logger.info(f"resume model weights from : {cfg.check_point_path}")
+    #     student_model.from_pretrained(cfg.check_point_path)
+    #     logger.info("success")
 
     for param in student_model.parameters():
         param.requires_grad = False
@@ -56,19 +55,16 @@ def build_model(cfg:TrainConfig):
     for module_name, module in student_model.named_modules():
         # 检查当前模块的类型是否是我们的目标自定义层
         if isinstance(module, HybridDecoderLayers):
+            module.gradient_checkpointing = True
 
             print(f"✅ Found Hybrid Layer: '{module_name}'. Unfreezing its components.")
-            module.gradient_checkpointing = True
-            # 将该模块内的 mamba 和 mlp 的参数设为可训练
             for sub_module_name, sub_module in module.named_children():
-                if sub_module_name == "self_attn_mamba" :
+                if sub_module_name == "self_attn_mamba" or sub_module_name == "mlp" or sub_module_name == "input_layernorm" or sub_module_name == "post_attention_layernorm":
                     print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
                     for param in sub_module.parameters():
                         param.requires_grad = True
-
-    # student_model.from_pretrained("/home/jinkaiyan/outputs/0910/final",torch_dtype=cfg.dtype)
-    # student_model.gradient_checkpointing_enable()
-
+    student_model.gradient_checkpointing_enable()
+    logger.info("Successfully load Student, Building tok")
 
     tok = AutoTokenizer.from_pretrained(cfg.teacher_name, local_files_only=True, use_fast=True)
     if tok.pad_token_id is None:
@@ -77,7 +73,7 @@ def build_model(cfg:TrainConfig):
     logger.info("Processor")
     processor = AutoProcessor.from_pretrained(cfg.teacher_name, local_files_only=True)
 
-    return teacher_model,student_wrapper,student_model,tok, processor
+    return student_wrapper,student_model,tok, processor
 
 def evaluate(model, loader, accel: Accelerator):
     model.eval()
@@ -111,25 +107,18 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     hf_logging.set_verbosity_error()
     # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(log_with="tensorboard", project_dir=cfg.logging_dir
-                              ,gradient_accumulation_steps=cfg.grad_accum,
-                             )
+    accelerator = Accelerator(log_with="tensorboard",
+                              project_dir=cfg.logging_dir,
+                              gradient_accumulation_steps=cfg.grad_accum,
+                              # kwargs_handlers=[ddp_kwargs]
+                              )
     set_seed(cfg.seed)
 
     accelerator.wait_for_everyone()
-    teacher_model, student_wrapper,student_model,tok,processor = build_model(cfg)
+    student_wrapper,student_model,tok,processor = build_model(cfg)
     if accelerator.is_main_process:
         report_path = "params_report.txt"
         with open(report_path, "w", encoding="utf-8") as f:
-            # teacher
-            f.write(f"teacher_model: {teacher_model}\n")
-
-            total_params = sum(p.numel() for p in teacher_model.parameters())
-            total_trainable_params = sum(
-                p.numel() for p in teacher_model.parameters() if p.requires_grad)
-
-            f.write(f"number of total params: {total_params}\n")
-            f.write(f"number of total trainable params: {total_trainable_params}\n\n")
 
             # student
             f.write(f"student_model: {student_model}\n")
@@ -156,17 +145,17 @@ def main():
     train_loader = DataLoader(dataset=train_dict['train_dataset'],batch_size=cfg.batch_size,
                               shuffle=True,num_workers=cfg.num_workers,collate_fn=train_dict['data_collator'],pin_memory=True )
 
-    cfg.grad_accum = cfg.grad_accum
+    cfg.grad_accum = cfg.grad_accum // accelerator.num_processes
 
     steps_per_epoch = math.ceil(len(train_loader) / cfg.grad_accum)
     total_update_steps = steps_per_epoch * cfg.num_epochs
 
     loss_config = DistillationLossConfig(
         kl_weight=1.,
-        l2_weight=1.,
+        l2_weight=1.0,
         ce_weight=0.0,
-        temperature=2.0,
-        l2_loss_layers=[0,6,12,18,24]
+        temperature=1.0,
+        l2_loss_layers=[0, 6, 12, 18]
     )
     distil_loss = VLMDitillationLoss(config=loss_config, use_topk=True)
     # Optimiser & scheduler
@@ -184,30 +173,20 @@ def main():
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
+
     optimizer = torch.optim.AdamW(optim_groups, lr=cfg.lr, betas=(cfg.adam_beta1, cfg.adam_beta2))
     scheduler = get_scheduler("cosine", optimizer,
                               num_warmup_steps=cfg.warmup_steps,
                               num_training_steps=total_update_steps // cfg.num_epochs)
     # prepare
     logger.info("Prepare")
-    teacher_model, student, optimizer, train_loader= accelerator.prepare(
-        teacher_model, student_model, optimizer, train_loader)
-    teacher_model.eval()
-
-    if cfg.check_point_path is not None and cfg.check_point_path != "" and cfg.resume_from_checkpoint:
-        accelerator.print(f"resume from checkpoint '{cfg.check_point_path}' 恢复训练...")
+    student, train_loader,optimizer= accelerator.prepare(
+        student_model, train_loader,optimizer)
+    if cfg.resume_from_checkpoint:
         accelerator.load_state(cfg.check_point_path)
-        # 加载后，你注册的 train_state 会被自动更新
-        accelerator.print("success in resuming！")
-    else:
-        accelerator.print("未找到 checkpoint, 从头开始训练。")
+        logger.info("load state")
 
-
-    if accelerator.is_main_process:
-        from torch.utils.tensorboard import SummaryWriter
-        tbwriter = SummaryWriter(log_dir=cfg.logging_dir)
-
-    logger.info("Train")
+    tbwriter = None
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dict['train_dataset'])}")
     logger.info(f"  Num Epochs = {cfg.num_epochs}")
@@ -217,56 +196,41 @@ def main():
     logger.info(f"  Total optimization steps = {total_update_steps}")
 
     global_step = 0
-    try :
-
+    import traceback
+    from pathlib import Path
+    from tqdm.auto import tqdm
+    import collections
+    try:
+        if accelerator.is_main_process:
+            from torch.utils.tensorboard import SummaryWriter
+            tbwriter = SummaryWriter(log_dir=cfg.logging_dir)
         for epoch in range(cfg.num_epochs):
             student.train()
-            from tqdm.auto import tqdm
-            import collections
             progress_bar = tqdm(
-                total = total_update_steps,
+                total=total_update_steps,
                 desc=f"Epoch {epoch + 1}/{cfg.num_epochs}",
-                disable=not accelerator.is_main_process
+                disable=not accelerator.is_main_process,
+                initial=global_step  # Make sure the progress bar starts from the correct step when resuming
             )
-            running_losses = collections.defaultdict(float)
+            running_loss = 0.0
 
             for step, batch in enumerate(train_loader):
+                # The main training logic for a single batch goes here
+                # ... (Your existing code for forward pass, loss calculation, etc.)
                 batch = {k: (v.to(accelerator.device, non_blocking=True) if hasattr(v, "to") else v)
                          for k, v in batch.items()}
-
-
-                kd_mask = (batch['labels'] != -100).to(torch.long)
-                if loss_config.l2_weight > 0:
-                    with torch.no_grad():
-                        t_out = teacher_model(**batch, output_hidden_states=True,)
-                        t_out_h = t_out.hidden_states
-                    s_out = student(**batch, output_hidden_states=True,teacher_outputs=t_out_h,distillation_layers=loss_config.l2_loss_layers,use_cache=False)
-                    total_loss, loss_details = distil_loss(
-                        student_logits=s_out.logits,
-                        teacher_logits=t_out.logits,
-                        student_ce_loss=s_out.loss,
-                        distillation_alignment_outputs = s_out.distillation_alignment_outputs,
-                        attention_mask=kd_mask,
-                    )
-
-                else:
-                    with torch.no_grad():
-                        t_out = teacher_model(**batch, output_hidden_states=True)
-                    s_out = student(**batch, output_hidden_states=True)
-                    total_loss, loss_details = distil_loss(
-                        student_logits=s_out.logits,
-                        teacher_logits=t_out.logits,
-                        student_ce_loss=s_out.loss,
-                        distillation_alignment_outputs = None,
-                        attention_mask=kd_mask,
-                    )
-
-                # 应用梯度累积
-                loss_for_backward = total_loss / cfg.grad_accum
+                # input_ids = batch["input_ids"]
+                # labels = batch["labels"]
+                # attention_mask = batch["attention_mask"]
+                # images = batch["pixel_values"].to(cfg.dtype)
+                #
+                # kd_mask = (batch['labels'] != -100).to(torch.long)
+                s_out = student(**batch, output_hidden_states=True)
+                loss = s_out.loss
+                loss_for_backward = loss / cfg.grad_accum
                 accelerator.backward(loss_for_backward)
 
-                for k, v in loss_details.items():
-                    running_losses[k] += v.item() / cfg.grad_accum
+                running_loss+=loss.item()
 
                 if (step + 1) % cfg.grad_accum == 0:
                     accelerator.clip_grad_norm_(student.parameters(), 1.0)
@@ -274,50 +238,67 @@ def main():
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    progress_bar.update(1)  # Update progress bar on global step
 
+                    # Logging, progress bar updates, etc.
                     if accelerator.is_main_process:
-                        # 3. 更新进度条的后缀信息，动态显示损失和学习率
-                        progress_bar.set_postfix(
-                            loss=running_losses["total_loss"] / global_step,
-                            kl=running_losses['kl_loss'] / global_step,
-                            l2=running_losses['l2_loss'] / global_step,
-                            ce=running_losses['ce_loss'] / global_step,
-                            # z_loss=running_losses['z_loss']
-                            lr=scheduler.get_last_lr()[0],
-                            step= global_step
-                        )
-                        progress_bar.update(1)
 
-                        # 4. 按 global_step 记录到TensorBoard
+                    # 3. 更新进度条的后缀信息，动态显示损失和学习率
+
+                        progress_bar.set_postfix(
+
+                            ce=running_loss / global_step,
+
+                            # z_loss=running_losses['z_loss']
+
+                            lr=scheduler.get_last_lr()[0],
+
+                            step=global_step
+
+                        )
+
+                    # 4. 按 global_step 记录到TensorBoard
+
                         if global_step % 2 == 0:  # 您可以调整记录频率
-                            tbwriter.add_scalar('train/total_loss', running_losses['total_loss'] / global_step, global_step)
-                            tbwriter.add_scalar('train/kl_loss', running_losses['kl_loss'] / global_step, global_step)
-                            tbwriter.add_scalar('train/l2_loss', running_losses['l2_loss'] / global_step, global_step)
-                            tbwriter.add_scalar('train/ce_loss', running_losses['ce_loss'] / global_step, global_step)
+
+
+                            tbwriter.add_scalar('train/ce_loss',running_loss / global_step, global_step)
+
                             tbwriter.add_scalar('learning_rate', scheduler.get_last_lr()[0], global_step)
 
-                    # 保存模型检查点
+                    # Regular checkpoint saving
                     if cfg.save_steps and global_step % cfg.save_steps == 0:
                         path = Path(cfg.output) / f"step_{global_step}"
-                        path_1 = Path(cfg.output) / f"step_{global_step}_1"
                         accelerator.save_state(path)
-                        accelerator.unwrap_model(student).save_pretrained(path_1)
-
-                    # if cfg.eval_steps and global_step % cfg.eval_steps == 0:
-                    #     eval_loss = evaluate(student, eval_loader, accelerator)  # no val loader stub
-                    #     if accelerator.is_main_process:
-                    #         tbwriter.add_scalar('loss', eval_loss, global_step)
+                        # Optional: save pretrained version as well
+                        unwrapped_model = accelerator.unwrap_model(student)
+                        if accelerator.is_main_process:
+                            unwrapped_model.save_pretrained(path)
 
                 if global_step >= total_update_steps:
                     break
             if global_step >= total_update_steps:
                 break
-    except torch.cuda.OutOfMemoryError as e:
-        logger.error(f"Training failed with exception: {e}")
-        #save model
-        path2 = Path(cfg.output) / f"step_{global_step}_error"
-        accelerator.save_state(path2)
-        raise e
+
+    except Exception as e:
+        # This block will execute if any error occurs inside the `try` block
+        if accelerator.is_main_process:
+            # 1. Log the full error traceback for easier debugging
+            logger.error("An unexpected error occurred during training:")
+            logger.error(traceback.format_exc())
+
+            # 2. Create a path for the emergency checkpoint
+            error_path = Path(cfg.output) / f"error_checkpoint_step_{global_step}"
+            logger.info(f"Attempting to save an emergency checkpoint to: {error_path}")
+
+            # 3. Use accelerator.save_state for a robust save
+            # This saves the model, optimizer, scheduler, and RNG states
+            accelerator.save_state(error_path)
+
+            logger.info("Emergency checkpoint saved successfully.")
+
+        # 4. Re-raise the exception to ensure the script stops and reports the failure
+        raise
 
     # final save
     accelerator.wait_for_everyone()

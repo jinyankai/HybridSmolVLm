@@ -142,70 +142,89 @@ class Hybrid_SmolVLM(SmolVLMModel):
                 position_ids=position_ids,
             )
 
-            self.layers = self.text_model.layers
+            hidden_states = inputs_embeds
 
-
-            hidden_states = inputs_embeds  # 这是学生模型的初始 hidden_states
-            position_embeddings = self.text_model.rotary_emb(hidden_states, position_ids)
-            distillation_outputs = {}
+            # create position embeddings to be shared across the decoder layers
             all_hidden_states = () if output_hidden_states else None
+            all_teacher_hidden_states = (
+            teacher_outputs[0],) if output_hidden_states and teacher_outputs is not None else None
             all_self_attns = () if output_attentions else None
             next_decoder_cache = None
+            ## Build Position embeddings
+            position_embeddings = self.text_model.rotary_emb(hidden_states,position_ids)
+            distillation_outputs = {}
 
+            mamba_layer_id = 0
             self.layers = self.text_model.layers
-
             for layer_id, decoder_layer in enumerate(self.layers):
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings
-                )
-                # 更新学生主干路径的hidden_states
-                student_main_output = layer_outputs[0]
-                hidden_states = student_main_output
+                if isinstance(decoder_layer, HybridDecoderLayers):
+                    mamba_layer_id += 1
 
-                # --- 旁路：为蒸馏进行独立计算 (完全按照您的意图) ---
-                # 检查当前层是否是需要进行蒸馏的层
-                if teacher_outputs is not None and distillation_layers is not None and layer_id in distillation_layers:
-                    # 1. 获取教师在这一层的输入
-                    teacher_input_for_this_layer = teacher_outputs[layer_id]
-                    # 2. 将教师的输入喂给【学生】的当前层
-                    # 注意：这是一个独立的计算，不使用梯度检查点以避免逻辑复杂化
-                    # 并且它的输出只用于L2对齐，不影响学生的主干传播
-                    student_output_from_teacher_input = decoder_layer(
-                        teacher_input_for_this_layer,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=False,  # 在这里通常不需要关心attention
-                        use_cache=False,  # 也不需要cache
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings
-                    )[0]  # 我们只需要 hidden_state 输出
+                hidden_states_run = [hidden_states]
+                if teacher_outputs is not None:
+                    teacher_hidden_states = teacher_outputs[layer_id]
+                    hidden_states_run.append(teacher_hidden_states)
 
-                    # 3. 获取教师在这一层的目标输出
-                    teacher_target_output_for_this_layer = teacher_outputs[layer_id + 1]
+                hidden_states_out = []
+                for layer_id, decoder_layer in enumerate(self.layers):
+                    if output_hidden_states:
+                        all_hidden_states += (hidden_states,)
 
-                    # 4. 将（学生的计算结果，教师的目标）配对，存入字典
-                    distillation_outputs[layer_id] = (
-                    student_output_from_teacher_input, teacher_target_output_for_this_layer)
+                    # --- 【核心逻辑】如果当前层是需要对齐的层 ---
+                    if distillation_layers and layer_id in distillation_layers and self.gradient_checkpointing and self.training:
+                        # 1. 获取老师的输入 (即老师前一层的输出)
+                        teacher_input_state = teacher_outputs[layer_id]
+                        # 2. 将老师的输入送入当前学生层
+                        student_output_from_teacher_input = self._gradient_checkpointing_func(
+                            decoder_layer.__call__,
+                            teacher_input_state,  # 第1个参数: hidden_states
+                            causal_mask,  # 第2个参数: attention_mask
+                            position_ids,  # 第3个参数: position_ids
+                            past_key_values,  # 第4个参数: past_key_value
+                            output_attentions,  # 第5个参数: output_attentions
+                            use_cache,  # 第6个参数: use_cache
+                            cache_position,  # 第7个参数: cache_position
+                            position_embeddings,  # 第8个参数: position_embeddings
+                        )[0]  # 取 hidden_states
+                        # 3. 获取老师的输出 (对齐的目标)
+                        teacher_output_state = teacher_outputs[layer_id + 1]
+
+                        # 4. 存储这对儿，用于后续计算 L2 loss
+                        distillation_outputs[layer_id] = (student_output_from_teacher_input, teacher_output_state)
+
+                    # --- 学生模型正常的前向传播 ---
+                    # (这里的 gradient checkpointing 逻辑不变)
+                    layer_outputs = decoder_layer(
+                            hidden_states,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=past_key_values,
+                            output_attentions=output_attentions,
+                            use_cache=use_cache,
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,)
+                    hidden_states = layer_outputs[0]
+                    hidden_states_out.append(layer_outputs[0])
+
+                hidden_states = hidden_states_out[0]  # type: ignore
+
+                if teacher_outputs is not None and output_hidden_states and layer_id != len(self.layers) - 1:
+                    all_teacher_hidden_states += (hidden_states_out[1],)
 
                 if use_cache:
                     next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
 
             hidden_states = self.text_model.norm(hidden_states)
 
+            # add hidden states from the last decoder layer
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
 
             return DistillationModelOutput(
                 last_hidden_state=hidden_states,

@@ -23,16 +23,8 @@
   "bf16": {
     "enabled": true
   },
-  "flops_profiler": {
-    "enabled": true,
-    "profile_step": 10,
-    "module_depth": -1,
-    "top_modules": 3,
-    "detailed": true
-  },
   "gradient_clipping": 1.0,
-  "steps_per_print": 10,
-  "wall_clock_breakdown": true,
+  "steps_per_print": 20,
   "fp16": {
     "enabled": false
   },

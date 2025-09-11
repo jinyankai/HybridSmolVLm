@@ -23,7 +23,7 @@ class TrainingArguments(HFTrainingArguments):
     disable_flash_attn2: bool = field(default=False)
 
     max_seq_length: int = field(
-        default=16384, # This is the default value of the SmolVLM model
+        default=2048, # This is the default value of the SmolVLM model
         metadata={
             "help":
                 "Maximum sequence length. Sequences will be right padded (and possibly truncated)."

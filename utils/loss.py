@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional, Sequence
+from typing import Tuple, Optional, Sequence,Dict
+
+
 
 def _standardize(h: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     mean = h.mean(dim=-1, keepdim=True)
@@ -32,45 +34,49 @@ class VLMDitillationLoss(nn.Module):
     # ---------- 公共入口 ----------
     def forward(
         self,
-        student_logits: torch.Tensor,           # [B,T,V] 或 [B,V]
-        teacher_logits: torch.Tensor,           # [B,T,V] 或 [B,V]
-        student_ce_loss: torch.Tensor,          # 标准 CE 已按 ignore_index 算好
-        student_hidden_states: Tuple[torch.Tensor, ...],  # 每层 [B,T,D]
-        teacher_hidden_states: Tuple[torch.Tensor, ...],
-        attention_mask: Optional[torch.Tensor] = None,    # [B,T] 0/1
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        student_ce_loss: Optional[torch.Tensor],
+        distillation_alignment_outputs: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         dtype_out = student_logits.dtype
 
-        # ---- KL (soft-CE) with temperature & token mask ----
-        T = float(self.config.temperature)
-        kd_loss = self._kd_loss_masked(student_logits, teacher_logits, attention_mask, T)
+        # ---- 计算各个损失分量 ----
+        # KL Loss
+        kl_loss = self._kd_loss_masked(student_logits, teacher_logits, attention_mask, float(self.config.temperature))
 
-        # ---- L2 on selected layers (standardized + mask) ----
-        l2_loss = self._multi_layer_l2_masked(
-            student_hidden_states, teacher_hidden_states, None,
-            layers=self.config.l2_loss_layers or [-1],
-            includes_embedding_slot=self.includes_embedding_slot
-        )
+        # L2 Loss
+        l2_loss = torch.tensor(0.0, device=student_logits.device)
+        if distillation_alignment_outputs:
+            l2_loss = self._l2_loss_aligned(distillation_alignment_outputs, attention_mask)
 
-        # ---- z-loss（可选）----
+        # Z-Loss
         z_loss = self._z_loss(student_logits, attention_mask, alpha=self.z_loss_alpha)
 
-        # ---- 组合 ----
-        total = (
-            self.config.kl_weight * kd_loss +
-            self.config.l2_weight * l2_loss +
-            self.config.ce_weight * student_ce_loss +
-            z_loss
-        )
+        # ---- 使用配置中的权重组合总损失 ----
+        # 确保 student_ce_loss 不为 None
+        if student_ce_loss is None:
+            # 如果不提供CE loss，可以认为其权重为0或抛出错误
+            ce_loss_component = torch.tensor(0.0, device=student_logits.device)
+        else:
+            ce_loss_component = student_ce_loss
 
+        # 这是用于反向传播的总损失
+        total_loss = (self.config.kl_weight * kl_loss +
+                      self.config.l2_weight * l2_loss +
+                      self.config.ce_weight * ce_loss_component +
+                      z_loss) # z_loss 自带了 alpha 权重
+
+        # ---- 准备用于日志记录的字典 ----
         comps = {
-            "kl_loss": kd_loss.detach().to(dtype_out),
+            "kl_loss": kl_loss.detach().to(dtype_out),
             "l2_loss": l2_loss.detach().to(dtype_out),
-            "ce_loss": student_ce_loss.detach().to(dtype_out),
+            "ce_loss": ce_loss_component.detach().to(dtype_out),
             "z_loss": z_loss.detach().to(dtype_out),
-            "total_loss": total.detach().to(dtype_out),
+            "total_loss": total_loss.detach().to(dtype_out),
         }
-        return total.to(dtype_out), comps
+        return total_loss.to(dtype_out), comps
 
     # ---------- 细节实现 ----------
     def _kd_loss_masked(self, logits_s, logits_t, attn_mask, T: float):
@@ -106,6 +112,43 @@ class VLMDitillationLoss(nn.Module):
         denom = valid.sum().clamp_min(1.0)
         return (per_tok * valid).sum() / denom * (T * T)
 
+    def _l2_loss_aligned(
+            self,
+            align_outputs: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+            kd_mask: Optional[torch.Tensor],
+            eps: float = 1e-6,
+    ):
+        if not align_outputs:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        total_mse = 0.0
+        for layer_idx, (s_out, t_out) in align_outputs.items():
+            s = s_out.float()
+            t = t_out.detach().float()
+
+            # 标准化 (与你之前的逻辑保持一致)
+
+
+            # Token 级 MSE -> [B, T]
+            mse_tok = (s - t).pow(2).mean(dim=-1)
+
+            # 掩码聚合
+            if kd_mask is not None:
+                valid = kd_mask.to(mse_tok.dtype)
+                # 保证 mask 和 mse_tok 长度一致
+                T_min = min(valid.size(1), mse_tok.size(1))
+                valid_trunc = valid[:, :T_min]
+                mse_tok_trunc = mse_tok[:, :T_min]
+
+                denom = valid_trunc.sum().clamp_min(1.0)
+                loss_i = (mse_tok_trunc * valid_trunc).sum() / denom
+            else:
+                loss_i = mse_tok.mean()
+
+            total_mse += loss_i
+
+        return total_mse / max(len(align_outputs), 1)
+
     def _multi_layer_l2_masked(
             self,
             hs_s: Tuple[torch.Tensor, ...],
@@ -138,7 +181,7 @@ class VLMDitillationLoss(nn.Module):
 
         for idx in abs_layers:
             s = hs_s[idx + off]
-            t = hs_t[idx + off].detach()
+            t = hs_t[idx + off]
 
             # 统一到 [B,T,D]
             if s.dim() == 2:

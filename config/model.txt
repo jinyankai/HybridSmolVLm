@@ -1,59 +1,398 @@
-HybridSmolVLMForConditionalGeneration(
-  (model): Hybrid_SmolVLM(
-    (vision_model): SmolVLMVisionTransformer(
-      (embeddings): SmolVLMVisionEmbeddings(
-        (patch_embedding): Conv2d(3, 1152, kernel_size=(14, 14), stride=(14, 14), padding=valid)
-        (position_embedding): Embedding(729, 1152)
+Idefics3Processor:
+- image_processor: Idefics3ImageProcessor {
+  "do_convert_rgb": true,
+  "do_image_splitting": true,
+  "do_normalize": true,
+  "do_pad": true,
+  "do_rescale": true,
+  "do_resize": true,
+  "image_mean": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "image_processor_type": "Idefics3ImageProcessor",
+  "image_std": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "max_image_size": {
+    "longest_edge": 512
+  },
+  "processor_class": "Idefics3Processor",
+  "resample": 1,
+  "rescale_factor": 0.00392156862745098,
+  "size": {
+    "longest_edge": 2048
+  }
+}
+
+- tokenizer: GPT2TokenizerFast(name_or_path='HuggingFaceTB/SmolVLM-256M-Instruct', vocab_size=49152, model_max_length=8192, is_fast=True, padding_side='right', truncation_side='left', special_tokens={'bos_token': '<|im_start|>', 'eos_token': '<end_of_utterance>', 'unk_token': '<|endoftext|>', 'pad_token': '<|im_end|>', 'additional_special_tokens': ['<fake_token_around_image>', '<image>', '<end_of_utterance>']}, clean_up_tokenization_spaces=False, added_tokens_decoder={
+        0: AddedToken("<|endoftext|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        1: AddedToken("<|im_start|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        2: AddedToken("<|im_end|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        3: AddedToken("<repo_name>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        4: AddedToken("<reponame>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        5: AddedToken("<file_sep>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        6: AddedToken("<filename>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        7: AddedToken("<gh_stars>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        8: AddedToken("<issue_start>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        9: AddedToken("<issue_comment>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        10: AddedToken("<issue_closed>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        11: AddedToken("<jupyter_start>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        12: AddedToken("<jupyter_text>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        13: AddedToken("<jupyter_code>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        14: AddedToken("<jupyter_output>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        15: AddedToken("<jupyter_script>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        16: AddedToken("<empty_output>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49152: AddedToken("<global-img>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49153: AddedToken("<row_1_col_1>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49154: AddedToken("<row_1_col_2>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49155: AddedToken("<row_1_col_3>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49156: AddedToken("<row_1_col_4>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49157: AddedToken("<row_1_col_5>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49158: AddedToken("<row_1_col_6>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49159: AddedToken("<row_2_col_1>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49160: AddedToken("<row_2_col_2>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49161: AddedToken("<row_2_col_3>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49162: AddedToken("<row_2_col_4>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49163: AddedToken("<row_2_col_5>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49164: AddedToken("<row_2_col_6>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49165: AddedToken("<row_3_col_1>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49166: AddedToken("<row_3_col_2>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49167: AddedToken("<row_3_col_3>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49168: AddedToken("<row_3_col_4>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49169: AddedToken("<row_3_col_5>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49170: AddedToken("<row_3_col_6>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49171: AddedToken("<row_4_col_1>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49172: AddedToken("<row_4_col_2>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49173: AddedToken("<row_4_col_3>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49174: AddedToken("<row_4_col_4>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49175: AddedToken("<row_4_col_5>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49176: AddedToken("<row_4_col_6>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49177: AddedToken("<row_5_col_1>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49178: AddedToken("<row_5_col_2>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49179: AddedToken("<row_5_col_3>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49180: AddedToken("<row_5_col_4>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49181: AddedToken("<row_5_col_5>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49182: AddedToken("<row_5_col_6>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49183: AddedToken("<row_6_col_1>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49184: AddedToken("<row_6_col_2>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49185: AddedToken("<row_6_col_3>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49186: AddedToken("<row_6_col_4>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49187: AddedToken("<row_6_col_5>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49188: AddedToken("<row_6_col_6>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49189: AddedToken("<fake_token_around_image>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49190: AddedToken("<image>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49191: AddedToken("<|reserved_special_token_0|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49192: AddedToken("<|reserved_special_token_1|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49193: AddedToken("<|reserved_special_token_2|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49194: AddedToken("<|reserved_special_token_3|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49195: AddedToken("<|reserved_special_token_4|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49196: AddedToken("<|reserved_special_token_5|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49197: AddedToken("<|reserved_special_token_6|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49198: AddedToken("<|reserved_special_token_7|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49199: AddedToken("<|reserved_special_token_8|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49200: AddedToken("<|reserved_special_token_9|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49201: AddedToken("<|reserved_special_token_10|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49202: AddedToken("<|reserved_special_token_11|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49203: AddedToken("<|reserved_special_token_12|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49204: AddedToken("<|reserved_special_token_13|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49205: AddedToken("<|reserved_special_token_14|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49206: AddedToken("<|reserved_special_token_15|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49207: AddedToken("<|reserved_special_token_16|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49208: AddedToken("<|reserved_special_token_17|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49209: AddedToken("<|reserved_special_token_18|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49210: AddedToken("<|reserved_special_token_19|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49211: AddedToken("<|reserved_special_token_20|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49212: AddedToken("<|reserved_special_token_21|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49213: AddedToken("<|reserved_special_token_22|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49214: AddedToken("<|reserved_special_token_23|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49215: AddedToken("<|reserved_special_token_24|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49216: AddedToken("<|reserved_special_token_25|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49217: AddedToken("<|reserved_special_token_26|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49218: AddedToken("<|reserved_special_token_27|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49219: AddedToken("<|reserved_special_token_28|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49220: AddedToken("<|reserved_special_token_29|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49221: AddedToken("<|reserved_special_token_30|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49222: AddedToken("<|reserved_special_token_31|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49223: AddedToken("<|reserved_special_token_32|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49224: AddedToken("<|reserved_special_token_33|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49225: AddedToken("<|reserved_special_token_34|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49226: AddedToken("<|reserved_special_token_35|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49227: AddedToken("<|reserved_special_token_36|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49228: AddedToken("<|reserved_special_token_37|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49229: AddedToken("<|reserved_special_token_38|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49230: AddedToken("<|reserved_special_token_39|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49231: AddedToken("<|reserved_special_token_40|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49232: AddedToken("<|reserved_special_token_41|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49233: AddedToken("<|reserved_special_token_42|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49234: AddedToken("<|reserved_special_token_43|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49235: AddedToken("<|reserved_special_token_44|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49236: AddedToken("<|reserved_special_token_45|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49237: AddedToken("<|reserved_special_token_46|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49238: AddedToken("<|reserved_special_token_47|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49239: AddedToken("<|reserved_special_token_48|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49240: AddedToken("<|reserved_special_token_49|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49241: AddedToken("<|reserved_special_token_50|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49242: AddedToken("<|reserved_special_token_51|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49243: AddedToken("<|reserved_special_token_52|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49244: AddedToken("<|reserved_special_token_53|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49245: AddedToken("<|reserved_special_token_54|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49246: AddedToken("<|reserved_special_token_55|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49247: AddedToken("<|reserved_special_token_56|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49248: AddedToken("<|reserved_special_token_57|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49249: AddedToken("<|reserved_special_token_58|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49250: AddedToken("<|reserved_special_token_59|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49251: AddedToken("<|reserved_special_token_60|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49252: AddedToken("<|reserved_special_token_61|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49253: AddedToken("<|reserved_special_token_62|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49254: AddedToken("<|reserved_special_token_63|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49255: AddedToken("<|reserved_special_token_64|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49256: AddedToken("<|reserved_special_token_65|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49257: AddedToken("<|reserved_special_token_66|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49258: AddedToken("<|reserved_special_token_67|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49259: AddedToken("<|reserved_special_token_68|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49260: AddedToken("<|reserved_special_token_69|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49261: AddedToken("<|reserved_special_token_70|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49262: AddedToken("<|reserved_special_token_71|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49263: AddedToken("<|reserved_special_token_72|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49264: AddedToken("<|reserved_special_token_73|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49265: AddedToken("<|reserved_special_token_74|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49266: AddedToken("<|reserved_special_token_75|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49267: AddedToken("<|reserved_special_token_76|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49268: AddedToken("<|reserved_special_token_77|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49269: AddedToken("<|reserved_special_token_78|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49270: AddedToken("<|reserved_special_token_79|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49271: AddedToken("<|reserved_special_token_80|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49272: AddedToken("<|reserved_special_token_81|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49273: AddedToken("<|reserved_special_token_82|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49274: AddedToken("<|reserved_special_token_83|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49275: AddedToken("<|reserved_special_token_84|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49276: AddedToken("<|reserved_special_token_85|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49277: AddedToken("<|reserved_special_token_86|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49278: AddedToken("<|reserved_special_token_87|>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+        49279: AddedToken("<end_of_utterance>", rstrip=False, lstrip=False, single_word=False, normalized=False, special=True),
+}
+)
+
+{
+  "image_seq_len": 64,
+  "processor_class": "Idefics3Processor"
+}
+
+Idefics3ForConditionalGeneration(
+  (model): Idefics3Model(
+    (vision_model): Idefics3VisionTransformer(
+      (embeddings): Idefics3VisionEmbeddings(
+        (patch_embedding): Conv2d(3, 768, kernel_size=(16, 16), stride=(16, 16), padding=valid)
+        (position_embedding): Embedding(1024, 768)
       )
-      (encoder): SmolVLMEncoder(
+      (encoder): Idefics3Encoder(
         (layers): ModuleList(
-          (0-26): 27 x SmolVLMEncoderLayer(
-            (self_attn): SmolVLMVisionAttention(
-              (k_proj): Linear(in_features=1152, out_features=1152, bias=True)
-              (v_proj): Linear(in_features=1152, out_features=1152, bias=True)
-              (q_proj): Linear(in_features=1152, out_features=1152, bias=True)
-              (out_proj): Linear(in_features=1152, out_features=1152, bias=True)
+          (0-11): 12 x Idefics3EncoderLayer(
+            (self_attn): Idefics3VisionAttention(
+              (k_proj): Linear(in_features=768, out_features=768, bias=True)
+              (v_proj): Linear(in_features=768, out_features=768, bias=True)
+              (q_proj): Linear(in_features=768, out_features=768, bias=True)
+              (out_proj): Linear(in_features=768, out_features=768, bias=True)
             )
-            (layer_norm1): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
-            (mlp): SmolVLMVisionMLP(
+            (layer_norm1): LayerNorm((768,), eps=1e-06, elementwise_affine=True)
+            (mlp): Idefics3VisionMLP(
               (activation_fn): PytorchGELUTanh()
-              (fc1): Linear(in_features=1152, out_features=4304, bias=True)
-              (fc2): Linear(in_features=4304, out_features=1152, bias=True)
+              (fc1): Linear(in_features=768, out_features=3072, bias=True)
+              (fc2): Linear(in_features=3072, out_features=768, bias=True)
             )
-            (layer_norm2): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+            (layer_norm2): LayerNorm((768,), eps=1e-06, elementwise_affine=True)
           )
         )
       )
-      (post_layernorm): LayerNorm((1152,), eps=1e-06, elementwise_affine=True)
+      (post_layernorm): LayerNorm((768,), eps=1e-06, elementwise_affine=True)
     )
-    (connector): SmolVLMConnector(
-      (modality_projection): SmolVLMSimpleMLP(
-        (proj): Linear(in_features=10368, out_features=2048, bias=False)
+    (connector): Idefics3Connector(
+      (modality_projection): Idefics3SimpleMLP(
+        (proj): Linear(in_features=12288, out_features=576, bias=False)
       )
     )
     (text_model): LlamaModel(
-      (embed_tokens): Embedding(49155, 2048, padding_idx=2)
+      (embed_tokens): Embedding(49280, 576, padding_idx=2)
       (layers): ModuleList(
-        (0-23): 24 x LlamaDecoderLayer(
+        (0-29): 30 x LlamaDecoderLayer(
           (self_attn): LlamaAttention(
-            (q_proj): Linear(in_features=2048, out_features=2048, bias=False)
-            (k_proj): Linear(in_features=2048, out_features=2048, bias=False)
-            (v_proj): Linear(in_features=2048, out_features=2048, bias=False)
-            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_proj): Linear(in_features=576, out_features=576, bias=False)
+            (k_proj): Linear(in_features=576, out_features=192, bias=False)
+            (v_proj): Linear(in_features=576, out_features=192, bias=False)
+            (o_proj): Linear(in_features=576, out_features=576, bias=False)
           )
           (mlp): LlamaMLP(
-            (gate_proj): Linear(in_features=2048, out_features=8192, bias=False)
-            (up_proj): Linear(in_features=2048, out_features=8192, bias=False)
-            (down_proj): Linear(in_features=8192, out_features=2048, bias=False)
+            (gate_proj): Linear(in_features=576, out_features=1536, bias=False)
+            (up_proj): Linear(in_features=576, out_features=1536, bias=False)
+            (down_proj): Linear(in_features=1536, out_features=576, bias=False)
             (act_fn): SiLU()
           )
-          (input_layernorm): LlamaRMSNorm((2048,), eps=1e-05)
-          (post_attention_layernorm): LlamaRMSNorm((2048,), eps=1e-05)
+          (input_layernorm): LlamaRMSNorm((576,), eps=1e-05)
+          (post_attention_layernorm): LlamaRMSNorm((576,), eps=1e-05)
         )
       )
-      (norm): LlamaRMSNorm((2048,), eps=1e-05)
+      (norm): LlamaRMSNorm((576,), eps=1e-05)
       (rotary_emb): LlamaRotaryEmbedding()
     )
   )
-  (lm_head): Linear(in_features=2048, out_features=49155, bias=False)
+  (lm_head): Linear(in_features=576, out_features=49280, bias=False)
 )
+Idefics3Config {
+  "architectures": [
+    "Idefics3ForConditionalGeneration"
+  ],
+  "image_token_id": 49190,
+  "model_type": "idefics3",
+  "pad_token_id": 128002,
+  "scale_factor": 4,
+  "text_config": {
+    "_flash_attn_2_enabled": true,
+    "_name_or_path": "None",
+    "architectures": [
+      "VLlama3ForCausalLM"
+    ],
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "head_dim": 64,
+    "hidden_act": "silu",
+    "hidden_size": 576,
+    "initializer_range": 0.041666666666666664,
+    "intermediate_size": 1536,
+    "is_llama_config": true,
+    "max_position_embeddings": 8192,
+    "mlp_bias": false,
+    "model_type": "llama",
+    "neftune_noise_alpha": 0.0,
+    "num_attention_heads": 9,
+    "num_hidden_layers": 30,
+    "num_key_value_heads": 3,
+    "pad_token_id": 2,
+    "perceiver_config": {
+      "_name_or_path": "",
+      "add_cross_attention": false,
+      "architectures": null,
+      "attention_dropout": 0.0,
+      "bad_words_ids": null,
+      "begin_suppress_tokens": null,
+      "bos_token_id": null,
+      "chunk_size_feed_forward": 0,
+      "cross_attention_hidden_size": null,
+      "decoder_start_token_id": null,
+      "diversity_penalty": 0.0,
+      "do_sample": false,
+      "early_stopping": false,
+      "encoder_no_repeat_ngram_size": 0,
+      "eos_token_id": null,
+      "exponential_decay_length_penalty": null,
+      "finetuning_task": null,
+      "forced_bos_token_id": null,
+      "forced_eos_token_id": null,
+      "hidden_act": "silu",
+      "id2label": {
+        "0": "LABEL_0",
+        "1": "LABEL_1"
+      },
+      "is_decoder": false,
+      "is_encoder_decoder": false,
+      "label2id": {
+        "LABEL_0": 0,
+        "LABEL_1": 1
+      },
+      "length_penalty": 1.0,
+      "max_length": 20,
+      "min_length": 0,
+      "model_type": "vllama3",
+      "no_repeat_ngram_size": 0,
+      "num_beam_groups": 1,
+      "num_beams": 1,
+      "num_key_value_heads": 1,
+      "num_return_sequences": 1,
+      "output_attentions": false,
+      "output_hidden_states": false,
+      "output_scores": false,
+      "pad_token_id": null,
+      "prefix": null,
+      "problem_type": null,
+      "pruned_heads": {},
+      "qk_layer_norms_perceiver": false,
+      "remove_invalid_values": false,
+      "repetition_penalty": 1.0,
+      "resampler_depth": 6,
+      "resampler_head_dim": 96,
+      "resampler_n_heads": 16,
+      "resampler_n_latents": 64,
+      "return_dict": true,
+      "return_dict_in_generate": false,
+      "sep_token_id": null,
+      "suppress_tokens": null,
+      "task_specific_params": null,
+      "temperature": 1.0,
+      "tf_legacy_loss": false,
+      "tie_encoder_decoder": false,
+      "tie_word_embeddings": true,
+      "tokenizer_class": null,
+      "top_k": 50,
+      "top_p": 1.0,
+      "torch_dtype": null,
+      "torchscript": false,
+      "transformers_version": "4.46.0",
+      "typical_p": 1.0,
+      "use_bfloat16": false
+    },
+    "pixel_shuffle_factor": 4,
+    "pretraining_tp": 1,
+    "qk_layer_norms": false,
+    "rms_norm_eps": 1e-05,
+    "rope_interleaved": false,
+    "rope_scaling": null,
+    "rope_theta": 100000,
+    "torch_dtype": "bfloat16",
+    "transformers.js_config": {
+      "kv_cache_dtype": {
+        "fp16": "float16",
+        "q4f16": "float16"
+      }
+    },
+    "use_cache": true,
+    "use_resampler": false,
+    "vocab_size": 49280
+  },
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers.js_config": {
+    "kv_cache_dtype": {
+      "fp16": "float16",
+      "q4f16": "float16"
+    }
+  },
+  "transformers_version": "4.53.1",
+  "use_cache": true,
+  "vision_config": {
+    "attention_dropout": 0.0,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 768,
+    "image_size": 512,
+    "initializer_range": 0.02,
+    "intermediate_size": 3072,
+    "layer_norm_eps": 1e-06,
+    "max_image_size": {
+      "longest_edge": 512
+    },
+    "model_type": "idefics3_vision",
+    "num_attention_heads": 12,
+    "num_channels": 3,
+    "num_hidden_layers": 12,
+    "patch_size": 16,
+    "size": {
+      "longest_edge": 2048
+    },
+    "tie_word_embeddings": false,
+    "torch_dtype": "bfloat16",
+    "use_base_siglip": true
+  },
+  "vocab_size": 49280
+}
