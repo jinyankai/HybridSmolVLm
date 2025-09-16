@@ -30,6 +30,7 @@ class VLMDitillationLoss(nn.Module):
         self.includes_embedding_slot = includes_embedding_slot
         self.z_loss_alpha = z_loss_alpha
         self.mse = nn.MSELoss(reduction="none")  # 我们自己做按mask平均
+        self.warm_up_step = 83133
 
     # ---------- 公共入口 ----------
     def forward(
@@ -39,17 +40,19 @@ class VLMDitillationLoss(nn.Module):
         student_ce_loss: Optional[torch.Tensor],
         distillation_alignment_outputs: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]],
         attention_mask: Optional[torch.Tensor] = None,
+        step : int =None
     ):
         dtype_out = student_logits.dtype
 
+        new_kl_weight = self.kl_weight_scheduler(step) if step is not None else self.config.kl_weight
         # ---- 计算各个损失分量 ----
         # KL Loss
-        kl_loss = self._kd_loss_masked(student_logits, teacher_logits, attention_mask, float(self.config.temperature))
+        kl_loss = self._kd_loss_masked(student_logits, teacher_logits, float(self.config.temperature))
 
         # L2 Loss
         l2_loss = torch.tensor(0.0, device=student_logits.device)
         if distillation_alignment_outputs:
-            l2_loss = self._l2_loss_aligned(distillation_alignment_outputs, attention_mask)
+            l2_loss = self._l2_loss_aligned(distillation_alignment_outputs)
 
         # Z-Loss
         z_loss = self._z_loss(student_logits, attention_mask, alpha=self.z_loss_alpha)
@@ -63,7 +66,7 @@ class VLMDitillationLoss(nn.Module):
             ce_loss_component = student_ce_loss
 
         # 这是用于反向传播的总损失
-        total_loss = (self.config.kl_weight * kl_loss +
+        total_loss = (new_kl_weight * kl_loss +
                       self.config.l2_weight * l2_loss +
                       self.config.ce_weight * ce_loss_component +
                       z_loss) # z_loss 自带了 alpha 权重
@@ -75,11 +78,12 @@ class VLMDitillationLoss(nn.Module):
             "ce_loss": ce_loss_component.detach().to(dtype_out),
             "z_loss": z_loss.detach().to(dtype_out),
             "total_loss": total_loss.detach().to(dtype_out),
+            "kl_weight": new_kl_weight
         }
         return total_loss.to(dtype_out), comps
 
     # ---------- 细节实现 ----------
-    def _kd_loss_masked(self, logits_s, logits_t, attn_mask, T: float):
+    def _kd_loss_masked(self, logits_s, logits_t, T: float,attn_mask=None):
         # 统一到 [B,T,V]
         if logits_s.dim() == 2:
             logits_s = logits_s.unsqueeze(1)
@@ -115,7 +119,7 @@ class VLMDitillationLoss(nn.Module):
     def _l2_loss_aligned(
             self,
             align_outputs: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-            kd_mask: Optional[torch.Tensor],
+            kd_mask: Optional[torch.Tensor] = None,
             eps: float = 1e-6,
     ):
         if not align_outputs:
@@ -147,7 +151,7 @@ class VLMDitillationLoss(nn.Module):
 
             total_mse += loss_i
 
-        return total_mse / max(len(align_outputs), 1)
+        return total_mse
 
     def _multi_layer_l2_masked(
             self,
@@ -244,6 +248,10 @@ class VLMDitillationLoss(nn.Module):
         valid = attn_mask.float()
         denom = valid.sum().clamp_min(1.0)
         return ((z.pow(2) * valid).sum() / denom) * alpha
+
+    def kl_weight_scheduler(self,step : int,
+                            ):
+        return self.config.kl_weight * (1 + 1 * step / self.warm_up_step) if self.warm_up_step > 0 else self.config.kl_weight
 
 from dataclasses import dataclass, field
 from typing import List

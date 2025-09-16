@@ -2,14 +2,13 @@ import math
 
 import os
 
-from exceptiongroup import catch
-
 os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 from dataset.sharegpt4v import make_supervised_data_module,DataArguments
 from config.train_config import TrainConfig
 from model.decoder_layer import HybridDecoderLayers
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
 from model.model_wrapper import HybridSmolVLMForConditionalGeneration,HybridSmolVLMWrapper
+from model.load_sftensor import load_safetensors_to_dict,construct_language_layer_dict
 from transformers import AutoProcessor, AutoTokenizer, logging as hf_logging, get_scheduler
 from utils.loss import VLMDitillationLoss,DistillationLossConfig
 import logging
@@ -48,6 +47,16 @@ def build_model(cfg:TrainConfig):
                                                              attn_layers=mamba_cfg.attn_layers,
                                                              dtype=cfg.dtype)
     student_model = student_wrapper.model
+    # load weight
+    if cfg.prev_model_path is not None and cfg.resume_model:
+        logger.info(f"Loading previous model weights from {cfg.prev_model_path}")
+        prev_ckp = load_safetensors_to_dict(cfg.prev_model_path)
+        prev_checkpoint_layers, is_mamba_layer = construct_language_layer_dict(prev_ckp, mamba_cfg.n_layer)
+        print(is_mamba_layer)
+        for (layer_id, layer_ckp) in prev_checkpoint_layers.items():
+            if is_mamba_layer[layer_id]:
+                student_model.model.text_model.layers[layer_id].load_state_dict(layer_ckp)
+
 
     for param in student_model.parameters():
         param.requires_grad = False
@@ -61,13 +70,11 @@ def build_model(cfg:TrainConfig):
             module.gradient_checkpointing = True
             # 将该模块内的 mamba 和 mlp 的参数设为可训练
             for sub_module_name, sub_module in module.named_children():
-                if sub_module_name == "self_attn_mamba" :
+                if sub_module_name == "self_attn_mamba" or sub_module_name == "post_attention_layernorm":
                     print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
                     for param in sub_module.parameters():
                         param.requires_grad = True
 
-    # student_model.from_pretrained("/home/jinkaiyan/outputs/0910/final",torch_dtype=cfg.dtype)
-    # student_model.gradient_checkpointing_enable()
 
 
     tok = AutoTokenizer.from_pretrained(cfg.teacher_name, local_files_only=True, use_fast=True)
@@ -165,7 +172,7 @@ def main():
         kl_weight=1.,
         l2_weight=1.,
         ce_weight=0.0,
-        temperature=2.0,
+        temperature=1.0,
         l2_loss_layers=[0,6,12,18,24]
     )
     distil_loss = VLMDitillationLoss(config=loss_config, use_topk=True)
@@ -190,8 +197,8 @@ def main():
                               num_training_steps=total_update_steps // cfg.num_epochs)
     # prepare
     logger.info("Prepare")
-    teacher_model, student, optimizer, train_loader= accelerator.prepare(
-        teacher_model, student_model, optimizer, train_loader)
+    teacher_model, student, optimizer= accelerator.prepare(
+        teacher_model, student_model, optimizer)
     teacher_model.eval()
 
     if cfg.check_point_path is not None and cfg.check_point_path != "" and cfg.resume_from_checkpoint:
@@ -247,6 +254,7 @@ def main():
                         student_ce_loss=s_out.loss,
                         distillation_alignment_outputs = s_out.distillation_alignment_outputs,
                         attention_mask=kd_mask,
+                        step=global_step
                     )
 
                 else:
@@ -259,17 +267,21 @@ def main():
                         student_ce_loss=s_out.loss,
                         distillation_alignment_outputs = None,
                         attention_mask=kd_mask,
+                        step=None
                     )
 
                 # 应用梯度累积
-                loss_for_backward = total_loss / cfg.grad_accum
+                loss_for_backward = total_loss
                 accelerator.backward(loss_for_backward)
 
                 for k, v in loss_details.items():
-                    running_losses[k] += v.item() / cfg.grad_accum
+                    if k == "kl_weight":
+                        running_losses[k] = v
+                    else:
+                        running_losses[k] += v.item() / cfg.grad_accum
 
                 if (step + 1) % cfg.grad_accum == 0:
-                    accelerator.clip_grad_norm_(student.parameters(), 1.0)
+                    # accelerator.clip_grad_norm_(student.parameters(), 1.0)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -282,8 +294,9 @@ def main():
                             kl=running_losses['kl_loss'] / global_step,
                             l2=running_losses['l2_loss'] / global_step,
                             ce=running_losses['ce_loss'] / global_step,
-                            # z_loss=running_losses['z_loss']
+                            te_loss=t_out.loss.item(),
                             lr=scheduler.get_last_lr()[0],
+                            kl_weight = running_losses['kl_weight'],
                             step= global_step
                         )
                         progress_bar.update(1)
@@ -301,7 +314,6 @@ def main():
                         path = Path(cfg.output) / f"step_{global_step}"
                         path_1 = Path(cfg.output) / f"step_{global_step}_1"
                         accelerator.save_state(path)
-                        accelerator.unwrap_model(student).save_pretrained(path_1)
 
                     # if cfg.eval_steps and global_step % cfg.eval_steps == 0:
                     #     eval_loss = evaluate(student, eval_loader, accelerator)  # no val loader stub
@@ -312,27 +324,66 @@ def main():
                     break
             if global_step >= total_update_steps:
                 break
-    except torch.cuda.OutOfMemoryError as e:
+    except Exception as e :
         logger.error(f"Training failed with exception: {e}")
         #save model
         path2 = Path(cfg.output) / f"step_{global_step}_error"
         accelerator.save_state(path2)
         raise e
 
-    # final save
+    # =================================================================
+    # --- 开始：修改后的存储逻辑 ---
+    # =================================================================
     accelerator.wait_for_everyone()
+
+    # 1. 保存完整的Accelerator状态，用于未来可能的“继续训练”
+    # 这个状态包括了模型（可能是包装后的）、优化器、学习率调度器等。
+    # 这是恢复训练的最佳方式。我们将其保存在一个明确的目录中。
+    # 使用 try-except 来捕获由 shared_tensor 等问题引发的潜在存储错误。
+    try:
+        final_checkpoint_dir = Path(cfg.output) / "final_checkpoint"
+        final_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        accelerator.print(f"Saving final accelerator state to {final_checkpoint_dir}...")
+        accelerator.save_state(output_dir=final_checkpoint_dir)
+        accelerator.save_model(student, output_dir=final_checkpoint_dir / "model")
+        accelerator.print("Successfully saved accelerator state for resuming training.")
+    except Exception as e:
+        accelerator.print(f"Warning: Could not save the full accelerator state due to an error: {e}")
+        accelerator.print("This may affect your ability to resume training from this point.")
+        accelerator.print("Proceeding to save the final unwrapped model weights.")
+
+    # 2. 保存最终的、可用于推理的模型
+    # 这是与他人分享或部署模型的标准方式。
+    # 使用 `unwrap_model` 来获取底层的、原始的Hugging Face模型。
+    unwrapped_model = accelerator.unwrap_model(student)
+
+    # 仅在主进程上执行保存操作，以避免多进程并发写入导致文件损坏
     if accelerator.is_main_process:
-        out_dir = Path(cfg.output) / "final"
-        acc_out = Path(cfg.output)/ "last"
-        #if path doesn't exist create one
-        out_dir.mkdir(parents=True, exist_ok=True)
-        accelerator.save_state(output_dir=acc_out)
-        unwrapped = accelerator.unwrap_model(student)  # <-- this is the right "unwrap"
-        if hasattr(unwrapped, "save_pretrained"):
-            unwrapped.save_pretrained(out_dir)
+        final_model_dir = Path(cfg.output) / "final_model"
+        final_model_dir.mkdir(parents=True, exist_ok=True)
+        accelerator.print(f"Saving final unwrapped model for inference to {final_model_dir}...")
+
+        # 使用 `save_pretrained` 是Hugging Face推荐的最稳健的保存方式。
+        # 它能正确处理权重共享（tied weights / shared tensors）等复杂情况。
+        # safe_serialization=True 会保存为 .safetensors 格式，更安全、加载更快。
+        if hasattr(unwrapped_model, "save_pretrained"):
+            unwrapped_model.save_pretrained(
+                final_model_dir,
+                safe_serialization=False
+            )
+
         else:
-            accelerator.save(unwrapped.state_dict(), out_dir / "pytorch_model.bin")
-        tok.save_pretrained(out_dir)
+            # 如果模型没有 save_pretrained 方法（非HF模型），则回退到保存 state_dict
+            torch.save(unwrapped_model.state_dict(), final_model_dir / "pytorch_model.bin")
+
+        # 保存 tokenizer，以便后续可以轻松加载模型进行推理
+        tok.save_pretrained(final_model_dir)
+        accelerator.print(f"Successfully saved final model and tokenizer to {final_model_dir}.")
+
+    # =================================================================
+    # --- 结束：修改后的存储逻辑 ---
+    # =================================================================
+
     accelerator.end_training()
 
 if __name__ == "__main__":

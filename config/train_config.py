@@ -9,8 +9,8 @@ import torch
 @dataclass
 class TrainConfig:
     # I/O                                  # 仅 JSONL 数据时需要；Cauldron 可忽略
-    output: str = "/home/jinkaiyan/outputs/0911"
-    logging_dir: Optional[str] = "/home/jinkaiyan/outputs/0911/logs"
+    output: str = "/home/jinkaiyan/outputs/0914"
+    logging_dir: Optional[str] = "/home/jinkaiyan/outputs/0914/logs"
 
     # Dataset meta
     dataset: str = "HuggingFaceM4/the_cauldron"     # ["cauldron", "jsonl"]
@@ -23,16 +23,16 @@ class TrainConfig:
     num_epochs: int = 1
     lr_scheduler_type: str = "linear"  # ["linear", "cosine", "cosine_w_restarts", "polynomial", "constant", "constant_with_warmup", "warmup_stable_decay"]
     stable_steps: int = 200000
-    lr: float = 2e-4
-    weight_decay: float = 0.01
+    lr: float = 5e-4
+    weight_decay: float = 0.001
     batch_size: int = 1
     grad_accum: int = 8
-    warmup_steps: int = 10000
+    warmup_steps: int = 2000
     num_decay_steps: int = 600  # if >0, overrides num_epochs
     max_steps: int = -1
-    seed: int = 146  # 42
+    seed: int = 42  # 42
     adam_beta1: float = 0.9
-    adam_beta2: float = 0.95
+    adam_beta2: float = 0.999
 
     # Distillation
     temperature: float = 1.0
@@ -43,9 +43,11 @@ class TrainConfig:
 
     # Model specifics
     teacher_name: str = "HuggingFaceTB/SmolVLM-256M-Instruct"  # Teacher model name
-    check_point_path: str = "/home/jinkaiyan/outputs/0910/step_80000"
+    check_point_path: str = "/home/jinkaiyan/outputs/0913/final_checkpoint"
+    prev_model_path : str = "/home/jinkaiyan/outputs/0913/final_model/"
+    resume_model:bool = False
     resume_from_checkpoint : bool = False
-    attn_layers: List[int] = field(default_factory=lambda: [0,4, 8, 12,16])
+    attn_layers: List[int] = field(default_factory=lambda: [0,4,8,12,16])
     dtype = torch.bfloat16
     bf16: bool = True
     grad_checkpoint: bool = True
