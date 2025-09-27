@@ -1,298 +1,357 @@
-import torch
+from mamba_ssm.ops.triton.layer_norm import RMSNorm
+from torch import Tensor
+from transformers.activations import ACT2FN
 
-from typing import List, Optional, Tuple, Union
+from ..mamba2.hybrid_mamba_config import MambaConfig
+from ..mamba2.hybrid_mamba_layer import Mamba2
 
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from mamba_ssm.modules.mha import *
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+from flash_attn.layers.rotary import *
+from typing import Optional,Union,Tuple
 
 
-from transformers.models.smolvlm.modeling_smolvlm import (SmolVLMModel,
-                                                          SmolVLMBaseModelOutputWithPast, logger,
-                                                          DynamicCache, SmolVLMConfig,
-                                                          SmolVLMForConditionalGeneration, KwargsForCausalLM,
-                                                          SmolVLMCausalLMOutputWithPast)
-from transformers.processing_utils import Unpack
-from transformers.masking_utils import create_causal_mask
-from model.decoder_layer import HybridDecoderLayers
-import dataclasses
-from typing import Dict
+# =========================================================================================
+# === LLaMA-style MLP: Matches the MLP structure in SmolVLM/LLaMA.
+# =========================================================================================
+class LlamaMLP(nn.Module):
+    def __init__(self, d_model, intermediate_size, hidden_act, device=None, dtype=None):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.hidden_size = d_model
+        self.intermediate_size = intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, **factory_kwargs)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, **factory_kwargs)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False, **factory_kwargs)
+        self.act_fn = ACT2FN[hidden_act]
 
-@dataclasses.dataclass
-class DistillationModelOutput(SmolVLMBaseModelOutputWithPast):
-    distillation_alignment_outputs: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-class Hybrid_SmolVLM(SmolVLMModel):
-    def __init__(self,config : SmolVLMConfig):
-        super().__init__(config)
-        self.gradient_checkpointing = True
+
+class LlamaRotaryEmbedding(RotaryEmbedding):
+    def _init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        pixel_attention_mask: Optional[torch.BoolTensor] = None,
-        image_hidden_states: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        teacher_outputs = None,
-        distillation_layers: Optional[List[int]] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) :
-        r"""
-                pixel_attention_mask (`torch.Tensor` of shape `(batch_size, image_size, image_size)`, *optional*):
-                    Mask to avoid performing attention on padding pixel indices.
-                image_hidden_states (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
-                    The hidden states of the image encoder after modality projection.
-                """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            self,
+            qkv: torch.Tensor,
+            kv: Optional[torch.Tensor] = None,
+            seqlen_offset: Union[int, torch.Tensor] = 0,
+            max_seqlen: Optional[int] = None,
+            num_heads_q: Optional[int] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        seqlen = qkv.shape[1]
+
+        if max_seqlen is not None:
+            self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
+        elif isinstance(seqlen_offset, int):
+            self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
+        # Partial rotary embedding
+        qkv_rot, qkv_pas = (
+            qkv[..., : int(self.dim)],
+            qkv[..., int(self.dim):],
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.training and self.text_model.gradient_checkpointing and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-            )
-            use_cache = False
-
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
+        if kv is None:
+            if self.scale is None:
+                qkv_rot = apply_rotary_emb_qkv_(
+                    qkv_rot,
+                    self._cos_cached,
+                    self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+                return torch.cat([qkv_rot, qkv_pas], dim=-1)
+            else:
+                return apply_rotary_emb_qkv_(
+                    qkv_rot,
+                    self._cos_cached,
+                    self._sin_cached,
+                    self._cos_k_cached,
+                    self._sin_k_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
         else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+            kv_rot, kv_pas = (
+                kv[..., : int(self.dim)],
+                kv[..., int(self.dim):],
+            )
+            q_rot = qkv_rot
+            q_rot = apply_rotary_emb_func(
+                q_rot,
+                self._cos_cached,
+                self._sin_cached,
+                interleaved=self.interleaved,
+                inplace=True,
+                seqlen_offsets=seqlen_offset,
+            )
+            q = torch.cat([q_rot, qkv_pas], dim=-1)
+            if self.scale is None:
+                kv_rot = apply_rotary_emb_kv_(
+                    kv_rot,
+                    self._cos_cached,
+                    self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+            else:
+                kv_rot = apply_rotary_emb_kv_(
+                    kv_rot,
+                    self._cos_k_cached,
+                    self._sin_k_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+            kv = torch.cat([kv_rot, kv_pas], dim=-1)
+            return q, kv
 
-        past_seen_tokens = 0
-        if use_cache:
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            past_seen_tokens = past_key_values.get_seq_length()
+# =========================================================================================
+# === LLaMA-style MHA: Matches the MHA structure in SmolVLM/LLaMA.
+# =========================================================================================
+class LlamaMHA(MHA):
+    def __init__(self, rotary_emb_base, device, rotary_emb_interleaved=False, *args, **kwargs):
+        super().__init__(rotary_emb_interleaved=rotary_emb_interleaved, device=device, rotary_emb_base=rotary_emb_base,
+                         *args, **kwargs)
 
-        if inputs_embeds is not None and input_ids is None and past_seen_tokens == 0:
-            raise ValueError("When first calling the model, if input_embeds are passed, input_ids should not be None.")
-
-        if inputs_embeds is None:
-            inputs_embeds = self.text_model.get_input_embeddings()(input_ids).to(input_ids.device)
-
-        # START VISUAL INPUTS INTEGRATION
-        if pixel_values is not None and image_hidden_states is not None:
-            raise ValueError("You cannot specify both pixel_values and image_hidden_states at the same time")
-        elif pixel_values is not None:
-            image_hidden_states = self.get_image_features(pixel_values, pixel_attention_mask).to(input_ids.device)
-        elif image_hidden_states is not None:
-            image_hidden_states = image_hidden_states.to(dtype=self.dtype, device=input_ids.device)
-
-        if inputs_embeds is not None and image_hidden_states is not None:
-            # When we generate, we don't want to replace the potential image_token_id that we generated by images
-            # that simply don't exist
-            inputs_embeds = self.inputs_merger(
-                input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
-                image_hidden_states=image_hidden_states,
+        if self.rotary_emb_dim > 0:
+            assert LlamaRotaryEmbedding is not None, "rotary requires flash_attn to be installed"
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.rotary_emb_dim,
+                base=rotary_emb_base,
+                interleaved=rotary_emb_interleaved,
+                device=device,
             )
 
-        if teacher_outputs is None:
-
-            outputs = self.text_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=True,
-                cache_position=cache_position,
-                **kwargs,
+    def forward(self, x, inference_params=None):
+        if inference_params is not None and self.layer_idx not in inference_params.key_value_memory_dict:
+            inference_params.key_value_memory_dict[self.layer_idx] = self.allocate_inference_cache(
+                x.shape[0], inference_params.max_seqlen, dtype=x.dtype
             )
-            return DistillationModelOutput(
-                last_hidden_state=outputs.last_hidden_state,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-                image_hidden_states=image_hidden_states,
-                distillation_alignment_outputs=None
+        seqlen_offset = (
+            0
+            if inference_params is None
+            else (
+                inference_params.lengths_per_sample
+                if inference_params.lengths_per_sample is not None
+                else inference_params.seqlen_offset
             )
-        else:
-        # # NEW VERSION FOR DISTILLATION
-            if cache_position is None:
-                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-                cache_position = torch.arange(
-                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+        )
+        rotary_max_seqlen = inference_params.max_seqlen if inference_params is not None else None
+        qkv = self.in_proj(x)
+        if self.mlp_dim > 0:
+            qkv, x_mlp = qkv.split([qkv.shape[-1] - self.mlp_dim, self.mlp_dim], dim=-1)
+            x_mlp_up, x_mlp_gate = x_mlp.chunk(2, dim=-1)
+            x_mlp = x_mlp_up * F.silu(x_mlp_gate)
+        if self.d_conv > 0:
+            # The inference code for conv1d is pretty messy, should clean it up
+            if (inference_params is None or inference_params.seqlen_offset == 0):
+                if causal_conv1d_fn is None:
+                    qkv = rearrange(
+                        self.conv1d(rearrange(qkv, "b s d -> b d s"))[..., :-(self.d_conv - 1)], "b d s -> b s d"
+                    ).contiguous()
+                else:
+                    qkv = causal_conv1d_fn(
+                        qkv.transpose(1, 2),
+                        rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        self.conv1d.bias
+                    ).transpose(1, 2)
+                if inference_params is not None:
+                    _, conv_state = inference_params.key_value_memory_dict[self.layer_idx]
+                    # If we just take qkv[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                    # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                    qkv_t = rearrange(qkv, "b l d -> b d l")
+                    conv_state.copy_(F.pad(qkv_t, (self.d_conv - qkv_t.shape[-1], 0)))  # Update state (B D W)
+            else:
+                _, conv_state = inference_params.key_value_memory_dict[self.layer_idx]
+                assert qkv.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+                qkv = qkv.squeeze(1)
+                # Conv step
+                if causal_conv1d_update is None:
+                    conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+                    conv_state[:, :, -1] = qkv
+                    qkv = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+                    if self.conv1d.bias is not None:
+                        qkv = qkv + self.conv1d.bias
+                else:
+                    qkv = causal_conv1d_update(
+                        qkv,
+                        conv_state,
+                        rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                        self.conv1d.bias
+                    )
+                qkv = qkv.unsqueeze(1)
+        q, kv = qkv.split([self.num_heads * self.head_dim, self.num_heads_kv * 2 * self.head_dim], dim=-1)
+        q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
+        kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
+        if (
+                inference_params is None
+                or inference_params.seqlen_offset == 0
+                or (self.rotary_emb_dim == 0 or self.rotary_emb_dim % 16 != 0)
+        ):
+            if self.rotary_emb_dim > 0:
+                # import pdb; pdb.set_trace()
+                q, kv = self.rotary_emb(
+                    q, kv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
                 )
 
-            if position_ids is None:
-                position_ids = cache_position.unsqueeze(0)
+            if inference_params is None:
+                k, v = kv.unbind(dim=-3)
+                k = torch.repeat_interleave(k, dim=2, repeats=self.num_heads // self.num_heads_kv)
+                v = torch.repeat_interleave(v, dim=2, repeats=self.num_heads // self.num_heads_kv)
+                context = F.scaled_dot_product_attention(
+                    q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=self.causal,
+                    scale=self.softmax_scale
+                ).transpose(1, 2)
+            else:
+                context = self._update_kvcache_attention(q, kv, inference_params)
 
-            causal_mask = create_causal_mask(
-                config=self.config,
-                input_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
+        else:
+            context = self._apply_rotary_update_kvcache_attention(q, kv, inference_params)
+        context = rearrange(context, "... h d -> ... (h d)")
+        if self.mlp_dim > 0:
+            context = torch.cat([context, x_mlp], dim=-1)
+        out = self.out_proj(context)
+        return out
+
+    def _update_kvcache_attention(self, q, kv, inference_params):
+        """Write kv to inference_params, then do attention"""
+        if (
+                inference_params.seqlen_offset == 0
+                or flash_attn_with_kvcache is None
+        ):
+            # TODO: this only uses seqlen_offset and not lengths_per_sample.
+            kv = self._update_kv_cache(kv, inference_params)
+            k, v = kv.unbind(dim=-3)
+            k = torch.repeat_interleave(k, dim=2, repeats=self.num_heads // self.num_heads_kv)
+            v = torch.repeat_interleave(v, dim=2, repeats=self.num_heads // self.num_heads_kv)
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=self.causal, scale=self.softmax_scale
+            ).transpose(1, 2)
+        else:
+            batch = q.shape[0]
+            kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+            cache_seqlens = (
+                inference_params.lengths_per_sample[:batch]
+                if inference_params.lengths_per_sample is not None
+                else inference_params.seqlen_offset
+            )
+            return flash_attn_with_kvcache(
+                q,
+                kv_cache[:, :, 0],
+                kv_cache[:, :, 1],
+                kv[:, :, 0],
+                kv[:, :, 1],
+                cache_seqlens=cache_seqlens,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
             )
 
-            self.layers = self.text_model.layers
 
 
-            hidden_states = inputs_embeds  # 这是学生模型的初始 hidden_states
-            position_embeddings = self.text_model.rotary_emb(hidden_states, position_ids)
-            distillation_outputs = {}
-            all_hidden_states = () if output_hidden_states else None
-            all_self_attns = () if output_attentions else None
-            next_decoder_cache = None
-
-            self.layers = self.text_model.layers
-
-            for layer_id, decoder_layer in enumerate(self.layers):
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings
-                )
-                # 更新学生主干路径的hidden_states
-                student_main_output = layer_outputs[0]
-                hidden_states = student_main_output
-
-                # --- 旁路：为蒸馏进行独立计算 (完全按照您的意图) ---
-                # 检查当前层是否是需要进行蒸馏的层
-                if teacher_outputs is not None and distillation_layers is not None and layer_id in distillation_layers:
-                    # 1. 获取教师在这一层的输入
-                    teacher_input_for_this_layer = teacher_outputs[layer_id]
-                    # 2. 将教师的输入喂给【学生】的当前层
-                    # 注意：这是一个独立的计算，不使用梯度检查点以避免逻辑复杂化
-                    # 并且它的输出只用于L2对齐，不影响学生的主干传播
-                    student_output_from_teacher_input = decoder_layer(
-                        teacher_input_for_this_layer,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=False,  # 在这里通常不需要关心attention
-                        use_cache=False,  # 也不需要cache
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings
-                    )[0]  # 我们只需要 hidden_state 输出
-
-                    # 3. 获取教师在这一层的目标输出
-                    teacher_target_output_for_this_layer = teacher_outputs[layer_id + 1]
-
-                    # 4. 将（学生的计算结果，教师的目标）配对，存入字典
-                    distillation_outputs[layer_id] = (
-                    student_output_from_teacher_input, teacher_target_output_for_this_layer)
-
-                if use_cache:
-                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-
-            hidden_states = self.text_model.norm(hidden_states)
-
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            return DistillationModelOutput(
-                last_hidden_state=hidden_states,
-                past_key_values=next_decoder_cache,
-                hidden_states=all_hidden_states,
-                attentions=all_self_attns,
-                image_hidden_states=image_hidden_states,
-                distillation_alignment_outputs=distillation_outputs
-            )
-
-@dataclasses.dataclass
-class HybridOutputCausalLM(SmolVLMCausalLMOutputWithPast):
-    # ...
-    distillation_alignment_outputs: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None
-
-
-class HybridSmolVLMForConditionalGeneration(SmolVLMForConditionalGeneration):
-    def __init__(self,config:SmolVLMConfig):
-        super().__init__(config)
-        self.model = Hybrid_SmolVLM(config)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[list[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        pixel_attention_mask: Optional[torch.BoolTensor] = None,
-        image_hidden_states: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        return_dict: Optional[bool] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        teacher_outputs = None,
-        distillation_layers: Optional[List[int]] = None,
-        **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[tuple, SmolVLMCausalLMOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+# =========================================================================================
+# === LLaMA-style Transformer Layer: A state-aware wrapper for the original attention.
+# =========================================================================================
+class LlamaMHALayer(nn.Module):
+    def __init__(
+            self,
+            config,  # Should be the original LlamaConfig from the model
+            layer_idx: int,
+            device=None,
+            dtype=None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.layer_idx = layer_idx
+        # This MHA is a generic multi-head attention module that handles KV caching
+        self.mha = LlamaMHA(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_heads_kv=config.num_key_value_heads,
+            layer_idx=layer_idx,
+            qkv_proj_bias=False,
+            out_proj_bias=False,
+            rotary_emb_dim=config.hidden_size // config.num_attention_heads,
+            rotary_emb_base=config.rope_theta,
+            causal=True,
+            device=device,
+            dtype=dtype,
+            d_conv=0,
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act, **factory_kwargs)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **factory_kwargs)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **factory_kwargs)
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            pixel_values=pixel_values,
-            pixel_attention_mask=pixel_attention_mask,
-            image_hidden_states=image_hidden_states,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            cache_position=cache_position,
-            return_dict=True,
-            teacher_outputs=teacher_outputs,
-            distillation_layers=distillation_layers,
-            **kwargs,
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        """Pre-allocates the KV-Cache for this layer."""
+        return self.mha.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype,)
+
+    def forward(self, hidden_states: Tensor, inference_params=None, *args, **kwargs):
+        """
+        Forward pass that is compatible with the InferenceParams state manager.
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # The MHA module will use inference_params to read/write its KV-Cache
+        hidden_states = self.mha(hidden_states, inference_params)
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+# =========================================================================================
+# === LLaMA-style Mamba Layer: A Mamba block wrapped to fit into the LLaMA architecture.
+# =========================================================================================
+class LlamaMambaLayer(nn.Module):
+    def __init__(
+            self,
+            config: MambaConfig,  # This should be your MambaConfig
+            layer_idx: int,
+            device=None,
+            dtype=None
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.layer_idx = layer_idx
+        # The core Mamba2 module
+        self.self_attn_mamba= Mamba2(
+            d_model=config.d_model, d_inner=config.d_inner, d_xb=config.d_xb, layer_idx=layer_idx, **config.ssm_cfg,
+            **factory_kwargs
         )
+        self.mlp = LlamaMLP(config.d_model, config.intermediate_size, config.hidden_act, **factory_kwargs)
+        self.input_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps, **factory_kwargs)
+        self.post_attention_layernorm = RMSNorm(config.d_model, eps=config.rms_norm_eps, **factory_kwargs)
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+        """Pre-allocates the SSM and Conv states for this layer."""
+        return self.mamba.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
+
+    def forward(self, hidden_states: Tensor, inference_params=None, *args, **kwargs):
+        """
+        Forward pass that is compatible with the InferenceParams state manager.
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        # The Mamba2 module will use inference_params to read/write its states
+        hidden_states = self.self_attn_mamba(hidden_states, inference_params=inference_params)
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
-        hidden_states = outputs[0]
-        if isinstance(hidden_states, (tuple, list)):
-            hidden_states = hidden_states[0]
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
-            )
-
-        return HybridOutputCausalLM(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            image_hidden_states=outputs.image_hidden_states,
-            distillation_alignment_outputs=outputs.distillation_alignment_outputs
-        )

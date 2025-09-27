@@ -1,235 +1,176 @@
-import copy
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List
-import torch
-import transformers
 import ujson as json
+from typing import Dict, List, Union
+
+import torch
 from torch.utils.data import Dataset
 from PIL import Image
+import transformers
 
-# 从源文件中复用大部分辅助函数和常量
-from params import DataArguments
-from constants import *
+# 假设这些常量在你的项目其他地方有定义，与训练时保持一致。
+# 如果没有，你可以取消下面的注释并设置正确的值。
+# from .constants import EOS_TOKEN
+IGNORE_INDEX = -100
 
+LLAVA_IMAGE_TOKEN = "<image>"
+LLAVA_VIDEO_TOKEN = "<video>"
 
-# 假设这些常量定义在 constants.py 中
-# LLAVA_IMAGE_TOKEN = "<image>"
-# LLAVA_VIDEO_TOKEN = "<video>"
-# EOS_TOKEN = "<end_of_utterance>"
-# IGNORE_INDEX = -100
+EOS_TOKEN = "<end_of_utterance>" # 这是一个常见的 EOS token，你可能需要根据你的模型进行调整
 
-# 从源文件中复用这些工具函数
-def video_to_image_tokens(input_string, num_frames):
-    frame_tokens = "\n".join([LLAVA_IMAGE_TOKEN] * num_frames)
-    input_string = input_string.replace(LLAVA_VIDEO_TOKEN, frame_tokens)
-    return input_string
+# --- 辅助函数 (从 sharegpt4v.py 复制而来，以保证文件独立性) ---
 
-
-def replace_image_tokens(input_string, start_count=1):
-    count = start_count
-    if LLAVA_IMAGE_TOKEN not in input_string:
-        return input_string, count
-    while LLAVA_IMAGE_TOKEN + '\n' in input_string:
-        input_string = input_string.replace(LLAVA_IMAGE_TOKEN + '\n', "<image>", 1)
-        count += 1
-    return input_string, count
-
-
-def llava_to_openai(conversations, is_video=False, num_frames=None):
-    role_mapping = {"human": "user", "gpt": "assistant"}
-    transformed_data = []
-    image_count = 1
-    for conversation in conversations:
-        if is_video:
-            conversation['value'] = video_to_image_tokens(conversation["value"], num_frames)
-
-        transformed_content, image_count = replace_image_tokens(conversation["value"], image_count)
-        transformed_entry = {
-            "role": role_mapping.get(conversation["from"], conversation["from"]),
-            "content": transformed_content
-        }
-        transformed_data.append(transformed_entry)
-    return transformed_data
-
-
-def pad_pixel_values(pixel_values_list, pad_value=0.0):
-    if not any(pv is not None for pv in pixel_values_list):
-        return None
-
-    # 过滤掉 None 值，以防某些样本没有图像
-    valid_pvs = [pv for pv in pixel_values_list if pv is not None]
-    if not valid_pvs:
-        return None
-
-    batch_size = len(pixel_values_list)
-    frame_lengths = [pv.shape[1] for pv in valid_pvs]
-    T_max = max(frame_lengths)
-    _, _, C, H, W = valid_pvs[0].shape
-    dtype = valid_pvs[0].dtype
-    device = valid_pvs[0].device
-
-    output = torch.full((batch_size, T_max, C, H, W),
-                        fill_value=pad_value,
-                        dtype=dtype,
-                        device=device)
-
-    # 拷贝有效值
-    valid_idx = 0
-    for i, pv in enumerate(pixel_values_list):
-        if pv is not None:
-            t_i = pv.shape[1]
-            output[i, :t_i] = pv[0]
-            valid_idx += 1
+def pad_sequence(sequences: List[torch.Tensor], padding_side: str = 'right', padding_value: int = 0) -> torch.Tensor:
+    """
+    将一个序列列表填充到相同的长度。
+    sequences: 形状为 [seq_len, *] 的张量列表
+    """
+    assert padding_side in ['right', 'left']
+    if not sequences:
+        return torch.empty(0)
+    max_size = sequences[0].size()
+    trailing_dims = max_size[1:]
+    max_len = max(len(seq) for seq in sequences)
+    batch_size = len(sequences)
+    output = sequences[0].new_full((batch_size, max_len) + trailing_dims, padding_value)
+    for i, seq in enumerate(sequences):
+        length = seq.size(0)
+        if padding_side == 'right':
+            output.data[i, :length] = seq
+        else:
+            output.data[i, -length:] = seq
     return output
 
 
-class LazyEvalDataset(Dataset):
+# --- 评估数据集 ---
+
+class EvalDataset(Dataset):
     """
-    用于验证的数据集。
-    它会处理好多轮对话历史，并只返回生成任务所需的 prompt 部分。
+    用于评估的数据集，专门处理以下特定JSON格式：
+    {"question_id": "...", "image": "...", "text": "..."}
     """
 
     def __init__(
-            self,
-            data_path: str | list,
-            processor: transformers.ProcessorMixin,
-            data_args: DataArguments,
+        self,
+        data_path: Union[str, List[Dict]],
+        processor: transformers.ProcessorMixin,
+        data_args,  # 应该包含 image_folder 路径
     ):
-        super(LazyEvalDataset, self).__init__()
-        # 数据加载逻辑与 LazySupervisedDataset 保持一致
-        list_data_dict = None
-        if isinstance(data_path, list):
-            list_data_dict = data_path
-        elif isinstance(data_path, str):
-            if os.path.isfile(data_path) and data_path.lower().endswith(".json"):
-                with open(data_path, "r") as f:
-                    list_data_dict = json.load(f)
-            else:
-                try:
-                    with open(data_path, "r") as f:
-                        list_data_dict = json.load(f)
-                except Exception as e:
-                    raise FileNotFoundError(f"无法解析 data_path='{data_path}'. 期望是 JSON 文件路径。")
+        """
+        Args:
+            data_path (Union[str, List[Dict]]): 数据文件路径 (JSON/JSONL) 或内存中的数据列表。
+            processor (transformers.ProcessorMixin): 用于处理文本和图像的处理器。
+            data_args: 包含额外参数的对象，如 data_args.image_folder。
+        """
+        super().__init__()
+        # --- MODIFIED: 处理文件路径 (str) 和内存中的列表 (list) ---
+        if isinstance(data_path, str):
+            try:
+                with open(data_path, "r", encoding='utf-8') as f:
+                    # 尝试将其作为单个JSON对象（可能是列表）加载
+                    try:
+                        self.list_data_dict = json.load(f)
+                        if not isinstance(self.list_data_dict, list):
+                             raise ValueError("JSON文件内容必须是一个列表。")
+                    except json.JSONDecodeError:
+                        # 如果作为单个JSON对象失败，回退到按行读取JSONL
+                        f.seek(0)
+                        self.list_data_dict = [json.loads(line) for line in f if line.strip()]
+            except Exception as e:
+                raise IOError(f"读取或解析文件失败 {data_path}: {e}")
+        elif isinstance(data_path, list):
+            # 如果 data_path 本身就是一个列表，直接使用它
+            self.list_data_dict = data_path
         else:
-            raise TypeError("data_path 必须是 list 或 str (JSON 路径)。")
+            raise TypeError(
+                f"data_path 必须是 str (文件路径) 或 list (内存中的数据)，但收到了 {type(data_path)}"
+            )
 
         self.processor = processor
-        self.list_data_dict = list_data_dict
         self.data_args = data_args
+        self.image_token = "<image>"
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.list_data_dict)
 
-    def __getitem__(self, i) -> Dict[str, torch.Tensor | str]:
-        sources = self.list_data_dict[i]
+    def __getitem__(self, i: int) -> Dict[str, Union[torch.Tensor, str]]:
+        """获取并处理单个数据样本。"""
+        item = self.list_data_dict[i]
+        question_id = item.get("question_id")
+        image_file = item.get("image")
+        text = item.get("text")
 
-        # 图像处理逻辑与训练脚本类似
-        pixel_values = None
-        if "image" in sources:
-            image_files = sources["image"]
-            image_folder = self.data_args.image_folder
-            if isinstance(image_files, str):
-                image_files = [image_files]
+        if not all([question_id, image_file, text]):
+             raise ValueError(f"数据索引 {i} 缺少必要的键 ('question_id', 'image', 'text')")
 
-            images = []
-            for image_file in image_files:
-                if not os.path.exists(image_file):
-                    image_file = os.path.join(image_folder, image_file)
-                images.append(Image.open(image_file).convert("RGB"))
+        # 1. 构建 prompt
+        # 这个格式至关重要，应与模型微调时使用的格式匹配。
+        # 格式: "User: <image>\n{question}\nAssistant:"
+        prompt = f"User: {self.image_token}\n{text.strip()}\n{EOS_TOKEN}\nAssistant: "
+
+        # 2. 加载和处理图像
+        image_folder = self.data_args.image_folder
+        if image_folder and not os.path.isabs(image_file):
+            image_path = os.path.join(image_folder, image_file)
         else:
-            images = None
+            image_path = image_file
 
-        # 将对话格式转换为 openai 格式
-        conversations = llava_to_openai(sources['conversations'])
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"图片文件未找到: {image_path}")
+        image = Image.open(image_path).convert("RGB")
 
-        # --- 验证逻辑的核心区别 ---
-        # 1. 构建包含所有对话历史的 prompt
-        # 2. 将最后一个 assistant 的回复作为 ground_truth
-        prompt_parts = []
-
-        # 遍历到倒数第二条消息（即最后一个用户问题）
-        for turn in conversations[:-1]:
-            role = turn['role']
-            content = turn['content']
-            if role == 'user':
-                # 空格很重要
-                if content.startswith(LLAVA_IMAGE_TOKEN):
-                    prompt_parts.append(f"User:{content}{EOS_TOKEN}")
-                else:
-                    prompt_parts.append(f"User: {content}{EOS_TOKEN}")
-            else:  # assistant
-                prompt_parts.append(f"Assistant: {content}{EOS_TOKEN}")
-
-        # 添加最后的 "Assistant: "，提示模型开始生成
-        prompt_parts.append("Assistant: ")
-
-        final_prompt = "\n".join(prompt_parts)
-
-        # 提取用于评估的真实答案
-        ground_truth = conversations[-1]['content']
-
-        # 使用 processor 处理文本和图像
-        if images:
-            inputs = self.processor(text=final_prompt, images=images, return_tensors='pt')
-            input_ids = inputs['input_ids'].squeeze(0)
-            pixel_values = inputs.get('pixel_values')
-        else:
-            inputs = self.processor.tokenizer(final_prompt, return_tensors='pt')
-            input_ids = inputs['input_ids'].squeeze(0)
-
-        return dict(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            ground_truth=ground_truth  # 保存真实答案文本
+        # 3. 使用 processor 准备模型输入
+        inputs = self.processor(
+            text=prompt,
+            images=image,
+            return_tensors='pt',
         )
 
-
-class DataCollatorForEvalDataset(object):
-    """
-    为验证任务收集和填充数据。
-    - 对 input_ids 进行左填充（Left Padding）。
-    - 收集 ground_truth 文本。
-    """
-
-    def __init__(self, processor: transformers.ProcessorMixin):
-        self.processor = processor
-
-    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor | List[str]]:
-        batch_input_ids = [example["input_ids"] for example in examples]
-        batch_pixel_values = [example.get("pixel_values") for example in examples]
-        ground_truths = [example["ground_truth"] for example in examples]
-
-        # 使用 processor.tokenizer.pad 进行填充，更健壮
-        # 对于生成任务，应使用 left padding
-        padded_inputs = self.processor.tokenizer.pad(
-            {"input_ids": batch_input_ids},
-            padding=True,
-            return_tensors="pt",
-            padding_side="left"
-        )
-
-        # 填充 pixel_values（如果存在）
-        pixel_values = pad_pixel_values(batch_pixel_values, pad_value=0.0)
-
-        batch_dict = dict(
-            input_ids=padded_inputs.input_ids,
-            attention_mask=padded_inputs.attention_mask,
-            ground_truths=ground_truths,
-        )
-
+        input_ids = inputs['input_ids'].squeeze(0)
+        pixel_values = inputs.get('pixel_values')
         if pixel_values is not None:
-            batch_dict['pixel_values'] = pixel_values
+            pixel_values = pixel_values.squeeze(0)
 
-        return batch_dict
+        return {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "question_id": question_id,
+        }
 
 
-def make_eval_data_module(processor, data_args):
-    """为验证构建 dataset 和 data_collator。"""
-    eval_dataset = LazyEvalDataset(
-        data_path=data_args.data_path, processor=processor, data_args=data_args
-    )
-    data_collator = DataCollatorForEvalDataset(processor=processor)
+# --- 评估数据整理器 ---
 
-    return dict(eval_dataset=eval_dataset,
-                data_collator=data_collator)
+class EvalDataCollator:
+    """
+    为评估整理样本。
+    填充输入并为模型生成准备批次。
+    """
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, examples: List[Dict]) -> Dict[str, Union[torch.Tensor, List[str]]]:
+        batch_input_ids = [ex["input_ids"] for ex in examples]
+        batch_pixel_values = [ex["pixel_values"] for ex in examples if ex.get("pixel_values") is not None]
+        question_ids = [ex["question_id"] for ex in examples]
+
+        # 填充 input_ids。对于生成任务，左填充是标准做法。
+        input_ids = pad_sequence(
+            batch_input_ids, padding_side='left', padding_value=self.pad_token_id
+        )
+
+        # 从填充后的 input_ids 创建 attention_mask
+        attention_mask = input_ids.ne(self.pad_token_id)
+
+        # 如果存在像素值，则堆叠它们
+        if batch_pixel_values:
+            pixel_values = torch.stack(batch_pixel_values, dim=0)
+        else:
+            pixel_values = None
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "question_ids": question_ids,
+        }
+

@@ -3,6 +3,8 @@ from collections import OrderedDict
 from transformers import AutoProcessor, BitsAndBytesConfig
 from model.mamba2.hybrid_mamba_config import PhiMambaConfig
 from model.inference.eval_hybridwrapper import EvalMamba2TransformerHybridModelWrapper
+import os
+os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 
 
 
@@ -53,15 +55,16 @@ def load_pretrained_model(model_name_or_path,pretrain_path, load_type='hf', load
             intermediate_size=1536,
             hidden_act="silu",
             n_layer=30,
-            attn_layers=[1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29],
+            attn_layers=[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+                         29],
             resid_pdrop=0.1,
             bidirectional=False,
             is_bias=False
         )
         # base_model = HybridSmolVLMForConditionalGeneration.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct",torch_dtype=torch.bfloat16,)
-        wrapper = EvalMamba2TransformerHybridModelWrapper.from_pretrained(model_name_or_path)
-        model = wrapper.model
-        processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
+        wrapper = EvalMamba2TransformerHybridModelWrapper.from_pretrained(pretrain_path,torch_dtype=torch.float16)
+        model = wrapper
+        processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct",local_files_only=True)
         image_processor = processor.image_processor
         tokenizer = processor.tokenizer
     else:

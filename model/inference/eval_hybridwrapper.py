@@ -2,16 +2,13 @@
 import os
 import json
 
-import torch.nn as nn
 
-
-from transformers import AutoModelForCausalLM
-
-from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
+from mamba_ssm.utils.hf import load_config_hf
 from transformers.utils.hub import cached_file
 
 
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from model.inference.hybrid_model import *
 
 from model.hybrid_model import *
 from model.load_sftensor import load_safetensors_to_dict, construct_language_layer_dict
@@ -24,15 +21,16 @@ from mamba_ssm.utils.generation import *
 def merge_projections_for_layers(checkpoint, layer_indices):
     for layer_idx in layer_indices:
         # Get the weights for q_proj, k_proj, and v_proj
-        q_proj_key = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-        q_proj_bias_key = f"model.layers.{layer_idx}.self_attn.q_proj.bias"
-        k_proj_key = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-        k_proj_bias_key = f"model.layers.{layer_idx}.self_attn.k_proj.bias"
-        v_proj_key = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-        v_proj_bias_key = f"model.layers.{layer_idx}.self_attn.v_proj.bias"
-        o_proj_key = f"model.layers.{layer_idx}.self_attn.o_proj.weight"
-        dense_key = f"model.layers.{layer_idx}.self_attn.dense.weight"
-        dense_bias_key = f"model.layers.{layer_idx}.self_attn.dense.bias"
+        print(f"Merging projections for layer {layer_idx}...", "*"*50)
+        q_proj_key = f"model.text_model.layers.{layer_idx}.self_attn.q_proj.weight"
+        q_proj_bias_key = f"model.text_model.layers.{layer_idx}.self_attn.q_proj.bias"
+        k_proj_key = f"model.text_model.layers.{layer_idx}.self_attn.k_proj.weight"
+        k_proj_bias_key = f"model.text_model.layers.{layer_idx}.self_attn.k_proj.bias"
+        v_proj_key = f"model.text_model.layers.{layer_idx}.self_attn.v_proj.weight"
+        v_proj_bias_key = f"model.text_model.layers.{layer_idx}.self_attn.v_proj.bias"
+        o_proj_key = f"model.text_model.layers.{layer_idx}.self_attn.o_proj.weight"
+        dense_key = f"model.text_model.layers.{layer_idx}.self_attn.dense.weight"
+        dense_bias_key = f"model.text_model.layers.{layer_idx}.self_attn.dense.bias"
 
         # Check if the keys exist in the checkpoint
         if q_proj_key in checkpoint and k_proj_key in checkpoint and v_proj_key in checkpoint:
@@ -45,7 +43,7 @@ def merge_projections_for_layers(checkpoint, layer_indices):
             in_proj_weight = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
 
             # Assign the new weight to the corresponding in_proj key
-            in_proj_key = f"model.layers.{layer_idx}.mha.in_proj.weight"
+            in_proj_key = f"model.text_model.layers.{layer_idx}.mha.in_proj.weight"
             checkpoint[in_proj_key] = in_proj_weight
 
             # Optionally, remove the old keys to clean up the checkpoint
@@ -63,7 +61,7 @@ def merge_projections_for_layers(checkpoint, layer_indices):
             in_proj_bias = torch.cat([q_proj_bias, k_proj_bias, v_proj_bias], dim=0)
 
             # Assign the new weight to the corresponding in_proj key
-            in_proj_bias_key = f"model.layers.{layer_idx}.mha.in_proj.bias"
+            in_proj_bias_key = f"model.text_model.layers.{layer_idx}.mha.in_proj.bias"
             checkpoint[in_proj_bias_key] = in_proj_bias
 
             # Optionally, remove the old keys to clean up the checkpoint
@@ -71,13 +69,13 @@ def merge_projections_for_layers(checkpoint, layer_indices):
             del checkpoint[k_proj_bias_key]
             del checkpoint[v_proj_bias_key]
         if o_proj_key in checkpoint:
-            out_proj_key = f"model.layers.{layer_idx}.mha.out_proj.weight"
+            out_proj_key = f"model.text_model.layers.{layer_idx}.mha.out_proj.weight"
             checkpoint[out_proj_key] = checkpoint[o_proj_key]
             del checkpoint[o_proj_key]
         elif dense_key in checkpoint:
-            out_proj_key = f"model.layers.{layer_idx}.mha.out_proj.weight"
+            out_proj_key = f"model.text_model.layers.{layer_idx}.mha.out_proj.weight"
             checkpoint[out_proj_key] = checkpoint[dense_key]
-            out_proj_bias = f"model.layers.{layer_idx}.mha.out_proj.bias"
+            out_proj_bias = f"model.text_model.layers.{layer_idx}.mha.out_proj.bias"
             checkpoint[out_proj_bias] = checkpoint[dense_bias_key]
 
     return checkpoint
@@ -91,7 +89,6 @@ def decode(
         input_ids,
         model,
         max_length,
-        inputs_embeds=None,
         image_embeds=None,
         top_k=1,
         top_p=0.0,
@@ -103,7 +100,14 @@ def decode(
         vocab_size=None,
         cg=False,
         enable_timing=False,
-        streamer: Optional[TextStreamer] = None
+        streamer: Optional[TextStreamer] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[list[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_attention_mask: Optional[torch.BoolTensor] = None,
+        image_hidden_states: Optional[torch.FloatTensor] = None,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -126,8 +130,10 @@ def decode(
     batch_size, seqlen_og = input_ids.shape
 
     if image_embeds is not None and inputs_embeds is not None:
-        max_length += image_embeds.shape[1] - 1
+        # max_length += image_embeds.shape[1] - 1
         batch_size, seqlen_og = inputs_embeds.shape[:2]
+        max_length+= seqlen_og - 1
+        print("Update Maxlen :" , max_length)
 
     teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
@@ -145,7 +151,7 @@ def decode(
     else:
         inference_params = InferenceParams(max_seqlen=max_length, max_batch_size=batch_size)
 
-    def get_logits(input_ids, inference_params, inputs_embeds=None):
+    def get_logits(input_ids, inference_params, image_hidden_states=None,inputs_embeds=None):
         decoding = inference_params.seqlen_offset > 0
         if decoding:
             position_ids = torch.full(
@@ -157,10 +163,12 @@ def decode(
         else:
             position_ids = None
         if not cg or not decoding:
+            # print(input_ids.shape)
             logits = model(
-                input_ids=input_ids if inputs_embeds is None else None,
-                inputs_embeds=inputs_embeds,
+                input_ids=input_ids ,
+                # attention_mask=attention_mask,
                 position_ids=position_ids,
+                pixel_values=pixel_values,
                 inference_params=inference_params,
                 num_last_tokens=1,
             ).logits.squeeze(dim=1)
@@ -175,8 +183,10 @@ def decode(
             token = sample(logits, top_k=top_k, top_p=top_p, min_p=min_p, temperature=temperature)
         else:
             token = teacher_outputs[:, inference_params.seqlen_offset]
-        # return rearrange(token, "b -> b 1")
         return token.unsqueeze(1)
+        # print(f"Shape of token before unsqueeze: {token.shape}")  # <-- 添加这行来调试
+        # return token
+
 
     def should_stop(current_token, inference_params):
         if inference_params.seqlen_offset == 0:
@@ -196,7 +206,7 @@ def decode(
     sequences_cat = input_ids
     # import pdb; pdb.set_trace()
     while not should_stop(sequences[-1], inference_params):
-        scores.append(get_logits(sequences[-1], inference_params, inputs_embeds=sequences_embeds[-1]))
+        scores.append(get_logits(sequences[-1], inference_params, ))
         inference_params.seqlen_offset += sequences_embeds[-1].shape[1]
         if repetition_penalty == 1.0:
             sampled_tokens = sample_tokens(scores[-1], inference_params)
@@ -230,17 +240,26 @@ class EvalMamba2TransformerHybridModelWrapper(nn.Module):
         self.attn_layers = attn_layers
         self.model : HybridSmolVLMForConditionalGeneration = transformer_model
         self.config = self.model.config
+        self.text_config = self.config.text_config
 
         for layer_idx in range(mamba_config.n_layer):
             if isinstance(self.model.model.text_model.layers[layer_idx], LlamaDecoderLayer):
                 if layer_idx in attn_layers:
-                    pass
+                    layer_decoder = LlamaMHALayer(
+                        config=self.text_config,
+                        layer_idx=layer_idx,
+                        device="cuda",
+                        dtype=dtype
+                    )
                 else:
-                    layer_encoder = HybridDecoderLayers(
+                    layer_decoder = LlamaMambaLayer(
                         mamba_config,
                         layer_idx,
+                        device="cuda",
+                        dtype=dtype,
                     )
-                    self.model.model.text_model.layers[layer_idx] = layer_encoder
+                self.model.model.text_model.layers[layer_idx] = layer_decoder
+                print(f"Replacing layer {layer_idx} with {layer_decoder.__class__.__name__}")
             else:
                 raise NotImplementedError
 
@@ -251,9 +270,15 @@ class EvalMamba2TransformerHybridModelWrapper(nn.Module):
             prev_ckp = load_safetensors_to_dict(checkpoint_path)
             prev_checkpoint_layers, is_mamba_layer = construct_language_layer_dict(prev_ckp, mamba_config.n_layer)
             print(is_mamba_layer)
-            for (layer_id, layer_ckp) in prev_checkpoint_layers.items():
-                if is_mamba_layer[layer_id]:
-                    self.model.model.text_model.layers[layer_id].load_state_dict(layer_ckp)
+            print("merging projections for layers:")
+            # for (layer_id, layer_ckp) in prev_checkpoint_layers.items():
+            #     if is_mamba_layer[layer_id]:
+            #         self.model.model.text_model.layers[layer_id].load_state_dict(layer_ckp)
+            ckpt = merge_projections_for_layers(checkpoint=prev_ckp,
+                                         layer_indices=attn_layers)
+            print("merge done start load")
+            self.model.load_state_dict(ckpt,strict=True)
+            print("done")
 
         self.model = self.model.to(dtype).cuda()
 
@@ -267,66 +292,188 @@ class EvalMamba2TransformerHybridModelWrapper(nn.Module):
             self,
             input_ids,
             max_new_tokens,
-            inputs_embeds=None,
-            image_embeds=None,
+            image_sizes: Optional[torch.Tensor] = None,
             top_k=1,
             top_p=0.0,
             min_p=0.0,
             temperature=1.0,
             return_dict_in_generate=False,
             output_scores=False,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[list[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            pixel_values: Optional[torch.FloatTensor] = None,
+            pixel_attention_mask: Optional[torch.BoolTensor] = None,
+            image_hidden_states: Optional[torch.FloatTensor] = None,
             **kwargs,
     ):
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+
+        if inputs_embeds is not None and input_ids is None:
+            raise ValueError("When first calling the model, if input_embeds are passed, input_ids should not be None.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.model.model.text_model.get_input_embeddings()(input_ids).to(input_ids.device)
+
+        # START VISUAL INPUTS INTEGRATION
+        if pixel_values is not None and image_hidden_states is not None:
+            raise ValueError("You cannot specify both pixel_values and image_hidden_states at the same time")
+        elif pixel_values is not None:
+            image_hidden_states = self.model.model.get_image_features(pixel_values, pixel_attention_mask).to(input_ids.device)
+        elif image_hidden_states is not None:
+            image_hidden_states = image_hidden_states.to(dtype=self.model.model.dtype, device=input_ids.device)
+
+        if inputs_embeds is not None and image_hidden_states is not None:
+            # When we generate, we don't want to replace the potential image_token_id that we generated by images
+            # that simply don't exist
+            inputs_embeds = self.model.model.inputs_merger(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                image_hidden_states=image_hidden_states,
+            )
         output = decode(
-            input_ids, self, max_length=max_new_tokens, inputs_embeds=inputs_embeds, image_embeds=image_embeds,
+            input_ids, self, max_length=max_new_tokens, inputs_embeds=inputs_embeds, pixel_values=pixel_values,attention_mask=attention_mask,image_embeds=image_hidden_states,
             top_k=top_k, top_p=top_p, min_p=min_p, temperature=temperature, **kwargs
         )
         if not output_scores:
             output.scores = None
         return output if return_dict_in_generate else output.sequences
 
-    def forward(self, input_ids, inputs_embeds=None, position_ids=None, inference_params=None, num_last_tokens=0,
-                **mixer_kwargs):
-        """
-        "position_ids" is just to be compatible with Transformer generation. We don't use it.
-        num_last_tokens: if > 0, only return the logits for the last n tokens
-        """
-        if inputs_embeds is None:
-            hidden_states = self.model.model.embed_tokens(input_ids, **mixer_kwargs)
+    def forward(
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[list[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            pixel_values: Optional[torch.FloatTensor] = None,
+            pixel_attention_mask: Optional[torch.BoolTensor] = None,
+            image_hidden_states: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            logits_to_keep: Union[int, torch.Tensor] = 0,
+            inference_params:Optional[InferenceParams]=None,
+            num_last_tokens: int = 0,
+            **kwargs: Unpack[FlashAttentionKwargs],
+    ):
+        r"""
+                pixel_attention_mask (`torch.Tensor` of shape `(batch_size, image_size, image_size)`, *optional*):
+                    Mask to avoid performing attention on padding pixel indices.
+                image_hidden_states (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+                    The hidden states of the image encoder after modality projection.
+                """
+        output_attentions = output_attentions if output_attentions is not None else self.model.model.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.model.model.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.model.model.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.model.model.config.use_return_dict
+
+        if self.model.model.training and self.model.model.text_model.gradient_checkpointing and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+            )
+            use_cache = False
+
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
         else:
-            hidden_states = inputs_embeds
-        for decoder_layer in self.model.model.text_model.layers:
-            hidden_states = decoder_layer(hidden_states, inference_params=inference_params, **mixer_kwargs)
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        past_seen_tokens = 0
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            past_seen_tokens = past_key_values.get_seq_length()
+
+        if inputs_embeds is not None and input_ids is None and past_seen_tokens == 0:
+            raise ValueError("When first calling the model, if input_embeds are passed, input_ids should not be None.")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.model.model.text_model.get_input_embeddings()(input_ids).to(input_ids.device)
+
+        # START VISUAL INPUTS INTEGRATION
+        if pixel_values is not None and image_hidden_states is not None:
+            raise ValueError("You cannot specify both pixel_values and image_hidden_states at the same time")
+        elif pixel_values is not None:
+            image_hidden_states = self.model.model.get_image_features(pixel_values, pixel_attention_mask).to(input_ids.device)
+        elif image_hidden_states is not None:
+            image_hidden_states = image_hidden_states.to(dtype=self.dtype, device=input_ids.device)
+
+        if inputs_embeds is not None and image_hidden_states is not None:
+            # When we generate, we don't want to replace the potential image_token_id that we generated by images
+            # that simply don't exist
+            inputs_embeds = self.model.model.inputs_merger(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                image_hidden_states=image_hidden_states,
+            )
+        hidden_states = inputs_embeds
+        for decoder_layers in self.model.model.text_model.layers:
+            hidden_states = decoder_layers(hidden_states,inference_params)
         if hasattr(self.model.model, "norm"):
             hidden_states = self.model.model.text_model.norm(hidden_states)
         elif hasattr(self.model.model, "final_layernorm"):
             hidden_states = self.model.model.text_model.final_layernorm(hidden_states)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = self.model.model.lm_head(hidden_states)
+
+        if isinstance(hidden_states, (tuple, list)):
+            hidden_states = hidden_states[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.model.lm_head(hidden_states)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+        return CausalLMOutput(logits=logits)
 
     @staticmethod
     def from_pretrained_local(pretrained_model_path, torch_dtype=torch.bfloat16,
                               attn_implementation="flash_attention_2"):
-        config_data = load_config_hf(pretrained_model_path)
-        transformer_model = HybridSmolVLMForConditionalGeneration.from_pretrained(config_data["_name_or_path"],
+        # config_data = load_config_hf(pretrained_model_path)
+        # print(config_data)
+        transformer_model = HybridSmolVLMForConditionalGeneration.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct",
                                                                  torch_dtype=torch_dtype,
                                                                  attn_implementation=attn_implementation,
                                                                  trust_remote_code=True)
-        with open(f'{pretrained_model_path}/{MAMBA_CONFIG_NAME}', 'r') as json_file:
-            config_dict = json.load(json_file)
+        # with open(f'{pretrained_model_path}/{MAMBA_CONFIG_NAME}', 'r') as json_file:
+        #     config_dict = json.load(json_file)
 
-        mamba_config = PhiMambaConfig(**config_dict)
+        mamba_cfg = PhiMambaConfig(
+            d_model=576,
+            ssm_cfg={"expand": 1, "ngroups": 9, "d_state": 64, "d_conv": 4},
+            rms_norm_eps=1e-05,
+            d_inner=576,
+            d_xb=192,
+            intermediate_size=1536,
+            hidden_act="silu",
+            n_layer=30,
+            attn_layers=[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+                         29],
+            resid_pdrop=0.1,
+            bidirectional=False,
+            is_bias=False
+        )
 
-        return EvalMamba2TransformerHybridModelWrapper(pretrained_model_path, transformer_model, mamba_config,
-                                                       mamba_config.attn_layers, torch_dtype, init_with_kqvo=False)
+        return EvalMamba2TransformerHybridModelWrapper(pretrained_model_path, transformer_model, mamba_cfg,
+                                                       mamba_cfg.attn_layers, torch_dtype, init_with_kqvo=False)
 
     @staticmethod
     def from_pretrained_hub(pretrained_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"):
         config_data = load_config_hf(pretrained_model_name)
-        transformer_model = HybridSmolVLMForConditionalGeneration.from_pretrained(config_data["_name_or_path"],
+        transformer_model = HybridSmolVLMForConditionalGeneration.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct",
                                                                  torch_dtype=torch_dtype,
                                                                  attn_implementation=attn_implementation)
         resolved_archive_file = cached_file(pretrained_model_name, MAMBA_CONFIG_NAME,

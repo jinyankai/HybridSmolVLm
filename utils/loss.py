@@ -66,7 +66,7 @@ class VLMDitillationLoss(nn.Module):
             ce_loss_component = student_ce_loss
 
         # 这是用于反向传播的总损失
-        total_loss = (new_kl_weight * kl_loss +
+        total_loss = (self.config.kl_weight * kl_loss +
                       self.config.l2_weight * l2_loss +
                       self.config.ce_weight * ce_loss_component +
                       z_loss) # z_loss 自带了 alpha 权重
@@ -78,7 +78,7 @@ class VLMDitillationLoss(nn.Module):
             "ce_loss": ce_loss_component.detach().to(dtype_out),
             "z_loss": z_loss.detach().to(dtype_out),
             "total_loss": total_loss.detach().to(dtype_out),
-            "kl_weight": new_kl_weight
+            "kl_weight": self.config.kl_weight
         }
         return total_loss.to(dtype_out), comps
 
@@ -93,7 +93,7 @@ class VLMDitillationLoss(nn.Module):
 
         # fp32 计算更稳
         ls = logits_s.float() / T
-        lt = logits_t.float() / T
+        lt = logits_t.float() / T / 2
 
         if self.use_topk:
             # Top-k KD
@@ -110,7 +110,7 @@ class VLMDitillationLoss(nn.Module):
             per_tok = -(q * log_p).sum(dim=-1)                    # [B,T]
 
         if attn_mask is None:
-            return per_tok.mean() * (T * T)
+            return per_tok.mean() * (T * T / 2)
 
         valid = attn_mask.float()
         denom = valid.sum().clamp_min(1.0)

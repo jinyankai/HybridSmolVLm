@@ -1,7 +1,5 @@
 import math
-
 import os
-
 os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 from dataset.sharegpt4v import make_supervised_data_module,DataArguments
 from config.train_config import TrainConfig
@@ -36,7 +34,7 @@ def build_model(cfg:TrainConfig):
         intermediate_size=1536,
         hidden_act="silu",
         n_layer=30,
-        attn_layers=[1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29],
+        attn_layers=[1,2,4,5, 7, 8, 10, 11,12, 13, 14, 15, 16, 17,18, 19, 20, 21, 22, 23,24, 25, 26, 27, 28, 29],
         resid_pdrop=0.1,
         bidirectional=False,
         is_bias=False
@@ -49,13 +47,20 @@ def build_model(cfg:TrainConfig):
     student_model = student_wrapper.model
     # load weight
     if cfg.prev_model_path is not None and cfg.resume_model:
+        # load from a local directory
         logger.info(f"Loading previous model weights from {cfg.prev_model_path}")
-        prev_ckp = load_safetensors_to_dict(cfg.prev_model_path)
-        prev_checkpoint_layers, is_mamba_layer = construct_language_layer_dict(prev_ckp, mamba_cfg.n_layer)
-        print(is_mamba_layer)
-        for (layer_id, layer_ckp) in prev_checkpoint_layers.items():
-            if is_mamba_layer[layer_id]:
-                student_model.model.text_model.layers[layer_id].load_state_dict(layer_ckp)
+        if os.path.exists(f"{cfg.prev_model_path}/pytorch_model.bin"):
+            # support save from bin file
+            student_model.load_state_dict(
+            torch.load(f"{cfg.prev_model_path}/pytorch_model.bin", map_location=torch.device("cpu")))
+
+        else:
+            prev_ckp = load_safetensors_to_dict(cfg.prev_model_path)
+            prev_checkpoint_layers, is_mamba_layer = construct_language_layer_dict(prev_ckp, mamba_cfg.n_layer)
+            print(is_mamba_layer)
+            for (layer_id, layer_ckp) in prev_checkpoint_layers.items():
+                if is_mamba_layer[layer_id]:
+                    student_model.model.text_model.layers[layer_id].load_state_dict(layer_ckp)
 
 
     for param in student_model.parameters():
@@ -70,10 +75,9 @@ def build_model(cfg:TrainConfig):
             module.gradient_checkpointing = True
             # 将该模块内的 mamba 和 mlp 的参数设为可训练
             for sub_module_name, sub_module in module.named_children():
-                if sub_module_name == "self_attn_mamba" or sub_module_name == "post_attention_layernorm":
-                    print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
-                    for param in sub_module.parameters():
-                        param.requires_grad = True
+                print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
+                for param in sub_module.parameters():
+                    param.requires_grad = True
 
 
 
@@ -173,7 +177,7 @@ def main():
         l2_weight=1.,
         ce_weight=0.0,
         temperature=1.0,
-        l2_loss_layers=[0,6,12,18,24]
+        l2_loss_layers=[0,3,6,9]
     )
     distil_loss = VLMDitillationLoss(config=loss_config, use_topk=True)
     # Optimiser & scheduler
@@ -192,13 +196,14 @@ def main():
     ]
 
     optimizer = torch.optim.AdamW(optim_groups, lr=cfg.lr, betas=(cfg.adam_beta1, cfg.adam_beta2))
-    scheduler = get_scheduler("cosine", optimizer,
+    scheduler = get_scheduler("warmup_stable_decay", optimizer,
                               num_warmup_steps=cfg.warmup_steps,
-                              num_training_steps=total_update_steps // cfg.num_epochs)
+                              num_training_steps=cfg.max_steps,
+                              scheduler_specific_kwargs={"num_stable_steps": cfg.stable_steps, "num_decay_steps": cfg.decay_steps})
     # prepare
     logger.info("Prepare")
-    teacher_model, student, optimizer= accelerator.prepare(
-        teacher_model, student_model, optimizer)
+    teacher_model, student, optimizer,train_loader= accelerator.prepare(
+        teacher_model, student_model, optimizer,train_loader)
     teacher_model.eval()
 
     if cfg.check_point_path is not None and cfg.check_point_path != "" and cfg.resume_from_checkpoint:
@@ -222,6 +227,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {cfg.batch_size*accelerator.num_processes}")
     logger.info(f"  Gradient Accumulation steps = {cfg.grad_accum}")
     logger.info(f"  Total optimization steps = {total_update_steps}")
+    accelerator.wait_for_everyone()
 
     global_step = 0
     try :
@@ -281,7 +287,7 @@ def main():
                         running_losses[k] += v.item() / cfg.grad_accum
 
                 if (step + 1) % cfg.grad_accum == 0:
-                    # accelerator.clip_grad_norm_(student.parameters(), 1.0)
+                    accelerator.clip_grad_norm_(student.parameters(), 1.0)
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -290,10 +296,10 @@ def main():
                     if accelerator.is_main_process:
                         # 3. 更新进度条的后缀信息，动态显示损失和学习率
                         progress_bar.set_postfix(
-                            loss=running_losses["total_loss"] / global_step,
-                            kl=running_losses['kl_loss'] / global_step,
-                            l2=running_losses['l2_loss'] / global_step,
-                            ce=running_losses['ce_loss'] / global_step,
+                            loss=running_losses["total_loss"] ,
+                            kl=running_losses['kl_loss'],
+                            l2=running_losses['l2_loss'],
+                            ce=running_losses['ce_loss'] ,
                             te_loss=t_out.loss.item(),
                             lr=scheduler.get_last_lr()[0],
                             kl_weight = running_losses['kl_weight'],
@@ -303,11 +309,13 @@ def main():
 
                         # 4. 按 global_step 记录到TensorBoard
                         if global_step % 2 == 0:  # 您可以调整记录频率
-                            tbwriter.add_scalar('train/total_loss', running_losses['total_loss'] / global_step, global_step)
-                            tbwriter.add_scalar('train/kl_loss', running_losses['kl_loss'] / global_step, global_step)
-                            tbwriter.add_scalar('train/l2_loss', running_losses['l2_loss'] / global_step, global_step)
-                            tbwriter.add_scalar('train/ce_loss', running_losses['ce_loss'] / global_step, global_step)
+                            tbwriter.add_scalar('train/total_loss', running_losses['total_loss'], global_step)
+                            tbwriter.add_scalar('train/kl_loss', running_losses['kl_loss'] , global_step)
+                            tbwriter.add_scalar('train/l2_loss', running_losses['l2_loss'] , global_step)
+                            tbwriter.add_scalar('train/ce_loss', running_losses['ce_loss'] , global_step)
                             tbwriter.add_scalar('learning_rate', scheduler.get_last_lr()[0], global_step)
+                    # 重置运行损失
+                    running_losses = collections.defaultdict(float)
 
                     # 保存模型检查点
                     if cfg.save_steps and global_step % cfg.save_steps == 0:

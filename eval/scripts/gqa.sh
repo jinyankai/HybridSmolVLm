@@ -12,10 +12,10 @@ MODEL_PATH=$1
 MODEL_NAME=$2
 CONV_MODE=$3
 TEMP=$4
-EVAL_DIR="playground/data/eval"
+EVAL_DIR="/data/jyk_data/eval"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
-    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m tinyllava.eval.model_vqa_loader \
+    CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m eval.eval.model_vqa_loader \
         --model-path $MODEL_PATH \
         --question-file $EVAL_DIR/gqa/$SPLIT.jsonl \
         --image-folder $EVAL_DIR/gqa/data/images \

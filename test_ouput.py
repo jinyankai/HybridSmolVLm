@@ -1,5 +1,8 @@
 import math
 import os
+
+from model.load_sftensor import load_safetensors_to_dict, construct_language_layer_dict
+
 os.environ['HF_ENDPOINT']="https://hf-mirror.com"
 from dataset.sharegpt4v import make_supervised_data_module,DataArguments
 from config.train_config import TrainConfig
@@ -25,30 +28,43 @@ def build_model(cfg:TrainConfig):
         param.requires_grad = False
     logger.log(logging.INFO, f"Teacher model {cfg.teacher_name} loaded successfully.")
     mamba_cfg = PhiMambaConfig(
-        d_model=2048,
-        ssm_cfg={"expand": 1, "ngroups":32, "d_state": 64,"d_conv": 4},
+        d_model=576,
+        ssm_cfg={"expand": 1, "ngroups": 32, "d_state": 64, "d_conv": 4},
         rms_norm_eps=1e-05,
-        d_inner=2048,
-        d_xb=2048,
-        intermediate_size=8192,
+        d_inner=576,
+        d_xb=192,
+        intermediate_size=1536,
         hidden_act="silu",
-        n_layer=24,
-        attn_layers=[0,1,2,3,5,6,7,9,10,11,12,13,14,15,17,18,19,21,22,23],
+        n_layer=30,
+        attn_layers=[4,5,6, 7, 8, 9, 10, 11,12, 13, 14, 15, 16, 17,18, 19, 20, 21, 22, 23,24, 25, 26, 27, 28, 29],
         resid_pdrop=0.1,
         bidirectional=False,
         is_bias=False
-        )
+    )
     student_wrapper = HybridSmolVLMWrapper.init_distillation(checkpoint_path=None,
                                                              tranformer_name=cfg.teacher_name,
                                                              mamba_config=mamba_cfg,
                                                              attn_layers=mamba_cfg.attn_layers,
                                                              dtype=cfg.dtype)
     student_model = student_wrapper.model
-    # if cfg.resume_from_checkpoint:
-    #     logger.info(f"resume model weights from : {cfg.check_point_path}")
-    #     student_model.from_pretrained(cfg.check_point_path)
-    #     logger.info("success")
-    student_model.gradient_checkpointing_enable()
+    # load weight
+    if cfg.prev_model_path is not None and cfg.resume_model:
+        # load from a local directory
+        logger.info(f"Loading previous model weights from {cfg.prev_model_path}")
+        if os.path.exists(f"{cfg.prev_model_path}/pytorch_model.bin"):
+            # support save from bin file
+            student_model.load_state_dict(
+            torch.load(f"{cfg.prev_model_path}/pytorch_model.bin", map_location=torch.device("cpu")))
+
+        else:
+            prev_ckp = load_safetensors_to_dict(cfg.prev_model_path)
+            prev_checkpoint_layers, is_mamba_layer = construct_language_layer_dict(prev_ckp, mamba_cfg.n_layer)
+            print(is_mamba_layer)
+            for (layer_id, layer_ckp) in prev_checkpoint_layers.items():
+                if is_mamba_layer[layer_id]:
+                    student_model.model.text_model.layers[layer_id].load_state_dict(layer_ckp)
+
+
     for param in student_model.parameters():
         param.requires_grad = False
 
@@ -58,16 +74,14 @@ def build_model(cfg:TrainConfig):
         if isinstance(module, HybridDecoderLayers):
 
             print(f"✅ Found Hybrid Layer: '{module_name}'. Unfreezing its components.")
-
+            module.gradient_checkpointing = True
             # 将该模块内的 mamba 和 mlp 的参数设为可训练
             for sub_module_name, sub_module in module.named_children():
-                if sub_module_name == "self_attn_mamba" or sub_module_name == "mlp" or sub_module_name == "post_attention_layernorm" or sub_module_name == "input_layernorm":
-                    print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
-                    for param in sub_module.parameters():
-                        param.requires_grad = True
+                print(f"  -- Unfreezing sub-module: '{sub_module_name}'")
+                for param in sub_module.parameters():
+                    param.requires_grad = True
 
 
-    logger.info("Successfully load Student, Building tok")
 
     tok = AutoTokenizer.from_pretrained(cfg.teacher_name, local_files_only=True, use_fast=True)
     if tok.pad_token_id is None:
@@ -187,17 +201,12 @@ def main():
                               num_training_steps=total_update_steps // cfg.num_epochs)
     # prepare
     logger.info("Prepare")
-    teacher_model, student= accelerator.prepare(
-        teacher_model, student_model)
+
     teacher_model.eval()
 
     if cfg.resume_from_checkpoint:
         accelerator.load_state(cfg.check_point_path)
         logger.info("load state")
-
-
-
-
 
     global_step = 0
     from transformers.image_utils import load_image
@@ -213,10 +222,10 @@ def main():
         },
     ]
     prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(text=prompt, images=[image], return_tensors="pt").to("cuda")
+    inputs = processor(text=prompt, images=[image], return_tensors="pt").to("cuda").to(torch.bfloat16)
 
     with torch.no_grad():
-        student_model = accelerator.unwrap_model(student)
+        logger.info("start generate")
         gen_ids = student_model.generate(**inputs)
     decoded_text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
     print(f"  - Generated text: \"{decoded_text.strip()}\"")
